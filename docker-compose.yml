@@ -1,0 +1,37 @@
+services:
+  postfix:
+    image: 01it/postfix:latest
+    container_name: postfix
+    environment:
+      - RELAY_HOST=[smtp.example.com]:587
+      - SMTP_USERNAME=example-sender
+      - SMTP_PASSWORD=example-password
+      - MAILNAME=example.com
+      - DOMAIN=example.com
+      - SSL_COUNTRY=US
+      - SSL_STATE=California
+      - SSL_LOCALITY=San Francisco
+      - SSL_ORGANIZATION=Example
+      - SSL_ORGANIZATIONAL_UNIT=IT Department
+      - MY_DESTINATION_DOMAINS=example.com
+      - MY_NETWORKS=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,143.198.12.200/32
+      # Dynamic Postfix configurations
+      - POSTFIX_soft_bounce=yes
+      - POSTFIX_disable_dns_lookups=yes
+      - POSTFIX_smtpd_delay_reject=no
+      - POSTFIX_smtpd_error_sleep_time=0
+      - POSTFIX_smtpd_client_restrictions=permit_mynetworks,permit
+      - POSTFIX_smtpd_helo_restrictions=permit_mynetworks,permit
+      - POSTFIX_smtpd_recipient_restrictions=permit_mynetworks,permit
+      - POSTFIX_smtpd_relay_restrictions=permit_mynetworks,reject_unauth_destination,permit
+    ports:
+      - "25:25"
+      - "587:587"
+    volumes:
+      - postfix_data:/var/spool/postfix
+      - postfix_certs:/etc/ssl/postfix
+    restart: unless-stopped
+
+volumes:
+  postfix_certs:
+  postfix_data:
