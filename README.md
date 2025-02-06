@@ -2,7 +2,7 @@
 
 [![Docker Pulls](https://img.shields.io/docker/pulls/01it/postfix.svg)](https://hub.docker.com/r/01it/postfix)
 [![Docker Stars](https://img.shields.io/docker/stars/01it/postfix.svg)](https://hub.docker.com/r/01it/postfix)
-[![GitHub release](https://img.shields.io/github/release/01it/docker-postfix.svg)](https://github.com/01it/docker-postfix/releases)
+[![GitHub release](https://img.shields.io/github/release/1it/docker-postfix.svg)](https://github.com/1it/docker-postfix/releases)
 
 Secure, minimal Postfix mail server with built-in TLS support and relay capabilities.
 
