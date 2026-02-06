@@ -4,86 +4,206 @@
 [![Docker Stars](https://img.shields.io/docker/stars/01it/postfix.svg)](https://hub.docker.com/r/01it/postfix)
 [![GitHub release](https://img.shields.io/github/release/1it/docker-postfix.svg)](https://github.com/1it/docker-postfix/releases)
 
-Secure, minimal Postfix mail server with built-in TLS support and relay capabilities.
+Lightweight Postfix mail relay with built-in DKIM signing, TLS support, and flexible delivery modes.
 
 ## Features
 
-- Minimal base image
-- Built-in TLS support
-- SMTP relay support
-- Automated TLS certificate generation
-- Configurable via environment variables
-- Proper permission handling
-- Volume support for persistent data
+- **Direct delivery** — send mail directly to recipient MX servers (default)
+- **Relay mode** — forward mail through an external SMTP provider (AWS SES, Gmail, etc.)
+- **DKIM signing** — embedded OpenDKIM with automatic key generation
+- **TLS** — auto-generated self-signed certs or Let's Encrypt
+- **Configurable** — all settings via environment variables
+- **Minimal** — multi-stage Debian Bookworm build
+- **Multi-arch** — `linux/amd64` and `linux/arm64`
 
 ## Quick Start
 
-Using pre-built image:
-
 ```bash
-docker run -d --name postfix -p 25:25 -p 587:587 -v postfix_data:/var/spool/postfix 01it/postfix:latest
+docker run -d --name postfix \
+  -e DOMAIN=example.com \
+  -e MAILNAME=mail.example.com \
+  -p 25:25 -p 587:587 \
+  -v dkim_keys:/etc/ssl/dkim \
+  01it/postfix:latest
 ```
 
-From source:
+On first startup, the container will:
+1. Generate a DKIM key pair and print the DNS TXT record to stdout
+2. Generate self-signed TLS certificates
+3. Start OpenDKIM and Postfix
 
-1. Clone the repository
-2. Build the image (optionally with custom configuration)
-3. Run the container
+Check logs for the DKIM public key:
+```bash
+docker logs postfix 2>&1 | grep -A2 "DKIM PUBLIC KEY"
+```
 
-Example docker-compose.yml:
-```bash 
-docker compose up -d
+## Operation Modes
+
+### Direct Delivery (default)
+
+Mail is delivered directly to recipient MX servers over port 25. This is the default when `RELAY_HOST` is not set.
+
+Requirements:
+- Outbound port 25 must be open (blocked by most cloud providers by default)
+- Proper DNS records configured (see [DNS Records](#dns-records))
+
+### Relay Mode
+
+Mail is forwarded through an external SMTP provider. Activated by setting `RELAY_HOST`.
+
+```yaml
+environment:
+  - RELAY_HOST=[smtp.example.com]:587
+  - SMTP_USERNAME=your-username
+  - SMTP_PASSWORD=your-password
 ```
 
 ## Configuration
 
-The container can be configured via environment variables:
+### Core Settings
 
-### TLS Configuration:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DOMAIN` | `example.com` | Domain for DKIM signing and certificate generation |
+| `MAILNAME` | `mail.example.com` | Postfix hostname (`myhostname`) |
+| `MY_NETWORKS` | `127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` | Trusted networks allowed to relay |
+| `MY_DESTINATION_DOMAINS` | — | Additional local destination domains |
 
-- `DOMAIN`: The domain name for the mail server
-- `SSL_COUNTRY`: The country for the TLS certificate
-- `SSL_STATE`: The state for the TLS certificate
-- `SSL_LOCALITY`: The locality for the TLS certificate
-- `SSL_ORGANIZATION`: The organization for the TLS certificate
-- `SSL_ORGANIZATIONAL_UNIT`: The organizational unit for the TLS certificate
+### DKIM Settings
 
-### SMTP Relay Configuration:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DKIM_SELECTOR` | `mail` | DKIM selector (used in DNS record name) |
+| `DKIM_KEY_DIR` | `/etc/ssl/dkim` | Directory for DKIM key storage |
+| `DKIM_EXTRA_DOMAINS` | — | Comma-separated extra domains to DKIM-sign (same key) |
 
-- `RELAY_HOST`: The relay host for the mail server
-- `SMTP_USERNAME`: The relay user for the mail server
-- `SMTP_PASSWORD`: The relay password for the mail server
+### Relay Settings
 
-### Postfix Custom Configuration via environment variables:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RELAY_HOST` | — | External SMTP relay (e.g., `[smtp.gmail.com]:587`) |
+| `SMTP_USERNAME` | — | Relay authentication username |
+| `SMTP_PASSWORD` | — | Relay authentication password |
 
-- `MAILNAME`: The mailname for the mail server
-- `MY_NETWORKS`: The networks access list for the inbound mail server
-- `MY_DESTINATION_DOMAINS`: The destination domains for the mail server
+### TLS Settings
 
-- `POSTFIX_any_postfix_config_directive`: The custom Postfix configuration directive, where `POSTFIX_` is the prefix of the directive, any configuration directive can be used.
-   For example: 
-   - `POSTFIX_smtpd_client_restrictions=permit_mynetworks,permit`
-   - `POSTFIX_smtpd_relay_restrictions=permit_mynetworks,reject_unauth_destination,permit`
-   - `POSTFIX_mynetworks=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LETSENCRYPT_EMAIL` | — | Enables Let's Encrypt; email for account registration |
+| `LETSENCRYPT_EXTRA_DOMAINS` | — | Comma-separated extra domains for the certificate (SANs) |
+| `SSL_COUNTRY` | `US` | Self-signed certificate country |
+| `SSL_STATE` | `State` | Self-signed certificate state |
+| `SSL_LOCALITY` | `City` | Self-signed certificate locality |
+| `SSL_ORGANIZATION` | `Organization` | Self-signed certificate organization |
+| `SSL_ORGANIZATIONAL_UNIT` | `IT` | Self-signed certificate OU |
 
+### Dynamic Postfix Configuration
+
+Any Postfix directive can be set via `POSTFIX_` prefix:
+```yaml
+environment:
+  - POSTFIX_message_size_limit=52428800
+  - POSTFIX_smtp_helo_name=mail.example.com
+```
+
+## DNS Records
+
+For reliable mail delivery, configure these DNS records for your domain:
+
+### PTR (Reverse DNS)
+
+Your server's IP must have a PTR record matching `MAILNAME`. Set this at your hosting provider.
+
+```
+203.0.113.1 → mail.example.com
+```
+
+### SPF
+
+Authorizes your server to send mail for your domain.
+
+```
+example.com.  IN  TXT  "v=spf1 mx ip4:203.0.113.1 -all"
+```
+
+### DKIM
+
+The container prints the DKIM public key on first startup. Add it as a TXT record:
+
+```
+mail._domainkey.example.com.  IN  TXT  "v=DKIM1; k=rsa; p=<PUBLIC_KEY>"
+```
+
+Replace `mail` with your `DKIM_SELECTOR` if different.
+
+### DMARC
+
+Controls how receivers handle authentication failures.
+
+```
+_dmarc.example.com.  IN  TXT  "v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com"
+```
+
+## Let's Encrypt
+
+For production use, real TLS certificates improve deliverability. Set `LETSENCRYPT_EMAIL` to enable:
+
+```yaml
+environment:
+  - LETSENCRYPT_EMAIL=admin@example.com
+  - DOMAIN=example.com
+ports:
+  - "80:80"    # Required for HTTP-01 challenge
+  - "25:25"
+  - "587:587"
+volumes:
+  - letsencrypt:/etc/letsencrypt
+```
+
+Port 80 must be accessible from the internet during certificate issuance. If certbot fails, the container falls back to self-signed certificates.
 
 ## Volumes
 
-- `postfix_data`: The volume for the postfix data
-- `postfix_certs`: The volume for the postfix certificates
+| Volume | Path | Description |
+|--------|------|-------------|
+| `postfix_data` | `/var/spool/postfix` | Mail queue and spool data |
+| `postfix_certs` | `/etc/ssl/postfix` | Self-signed TLS certificates |
+| `dkim_keys` | `/etc/ssl/dkim` | DKIM private/public key pair |
+| `letsencrypt` | `/etc/letsencrypt` | Let's Encrypt certificates (optional) |
+
+## Ports
+
+| Port | Protocol | Description |
+|------|----------|-------------|
+| 25 | SMTP | Standard mail delivery (direct mode) and receiving |
+| 465 | SMTPS | Implicit TLS submission |
+| 587 | Submission | Authenticated submission with STARTTLS |
+
+## Cloud Provider Notes
+
+Most cloud providers block outbound port 25 by default:
+
+- **AWS**: Request removal of port 25 restriction via support ticket
+- **GCP**: Blocked; use a relay or third-party SMTP service
+- **Azure**: Blocked on Basic/Standard tiers; use SendGrid or relay
+
+If port 25 is blocked, use relay mode with an external SMTP provider.
 
 ## Security
 
-- TLS enabled by default
-- Proper file permissions
-- Minimal base image to reduce attack surface
-- No default passwords or configurations
-
-The container will automatically generate a TLS certificate if it doesn't exist. The certificate will be generated using the `certgen.sh` script.
+- TLS 1.2+ enforced (SSLv2, SSLv3, TLSv1, TLSv1.1 disabled)
+- High-strength ciphers only
+- DKIM signing for outbound mail
+- SASL authentication on submission port
+- Proper sender/recipient restrictions
+- Minimal base image
 
 ## Logs
 
-The container will log to the console.
+All logs go to stdout:
+```bash
+docker logs -f postfix
+```
 
 ## Contributing
 
@@ -92,4 +212,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
-

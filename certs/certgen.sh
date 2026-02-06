@@ -73,10 +73,4 @@ if [ ! -f ${SSL_POSTFIX_DIR}/certs/postfix.crt ]; then
     chmod 600 ${SSL_POSTFIX_DIR}/private/postfix.key
 fi
 
-# Generate DH parameters if they don't exist
-if [ ! -f ${SSL_POSTFIX_DIR}/dhparams.pem ]; then
-    echo "Generating DH parameters (this may take a while)..."
-    openssl dhparam -out ${SSL_POSTFIX_DIR}/dhparams.pem 2048
-fi
-
 echo "Certificate generation completed successfully!"

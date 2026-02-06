@@ -9,14 +9,15 @@ mydestination = $myhostname, localhost, localhost.localdomain
 mynetworks = 127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 inet_interfaces = all
 inet_protocols = ipv4
+recipient_delimiter = +
 
-# Hostname checks
-disable_dns_lookups = yes
-smtpd_delay_reject = no
-smtpd_error_sleep_time = 0
+# DNS — enabled for direct MX delivery (default mode)
+disable_dns_lookups = no
 
 # TLS parameters for outbound SMTP (client)
-smtp_tls_security_level = encrypt
+# "may" = opportunistic TLS (required for direct delivery over port 25)
+# Overridden to "encrypt" when RELAY_HOST is set
+smtp_tls_security_level = may
 smtp_tls_mandatory_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
 smtp_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
 smtp_tls_mandatory_ciphers = high
@@ -29,7 +30,6 @@ smtpd_tls_key_file = /etc/ssl/postfix/private/postfix.key
 smtpd_tls_mandatory_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
 smtpd_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
 smtpd_tls_mandatory_ciphers = high
-smtpd_tls_dh1024_param_file = /etc/ssl/postfix/dhparams.pem
 
 # SASL Configuration
 smtpd_sasl_path = smtpd
@@ -39,9 +39,10 @@ smtpd_sasl_local_domain = $myhostname
 broken_sasl_auth_clients = yes
 
 # Access restrictions
-# Order is important: from less restrictive to more restrictive
-# HELO restrictions (more permissive)
 smtpd_helo_required = yes
+smtpd_delay_reject = no
+smtpd_error_sleep_time = 0
+
 smtpd_helo_restrictions =
     permit_mynetworks,
     permit
@@ -50,8 +51,17 @@ smtpd_client_restrictions =
     permit_mynetworks,
     permit
 
-smtpd_recipient_restrictions =
+smtpd_sender_restrictions =
     permit_mynetworks,
+    reject_non_fqdn_sender,
+    reject_unknown_sender_domain,
+    permit
+
+smtpd_recipient_restrictions =
+    reject_unauth_pipelining,
+    reject_non_fqdn_recipient,
+    permit_mynetworks,
+    reject_unauth_destination,
     permit
 
 # Relay control
@@ -60,9 +70,10 @@ smtpd_relay_restrictions =
     reject_unauth_destination,
     permit
 
-# AWS SES Relay Settings
-smtp_sasl_mechanism_filter = plain, login
-smtp_tls_note_starttls_offer = yes
-
-
-
+# DKIM signing via OpenDKIM milter
+milter_default_action = accept
+milter_protocol = 6
+smtpd_milters = inet:localhost:8891
+non_smtpd_milters = inet:localhost:8891
+milter_connect_timeout = 10s
+milter_command_timeout = 10s

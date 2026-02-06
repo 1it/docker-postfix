@@ -1,0 +1,1 @@
+__DKIM_SELECTOR__._domainkey.__DOMAIN__ __DOMAIN__:__DKIM_SELECTOR__:/etc/ssl/dkim/dkim.key
