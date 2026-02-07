@@ -149,9 +149,6 @@ fi
 if [ -n "$RELAY_HOST" ]; then
     echo "=== RELAY MODE: forwarding mail through $RELAY_HOST ==="
     postconf -e "relayhost = $RELAY_HOST"
-    postconf -e "smtp_sasl_auth_enable = yes"
-    postconf -e "smtp_sasl_security_options = noanonymous"
-    postconf -e "smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd"
     postconf -e "smtp_tls_security_level = encrypt"
     postconf -e "smtp_tls_note_starttls_offer = yes"
 
@@ -160,12 +157,34 @@ if [ -n "$RELAY_HOST" ]; then
         echo "${RELAY_HOST} ${SMTP_USERNAME}:${SMTP_PASSWORD}" > /etc/postfix/sasl_passwd
         postmap /etc/postfix/sasl_passwd
         chmod 600 /etc/postfix/sasl_passwd*
+        postconf -e "smtp_sasl_auth_enable = yes"
+        postconf -e "smtp_sasl_security_options = noanonymous"
+        postconf -e "smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd"
         postconf -e "smtp_sasl_mechanism_filter = plain, login"
     fi
 else
     echo "=== DIRECT MODE: delivering mail directly to recipient MX servers ==="
     postconf -e "smtp_tls_security_level = may"
     postconf -e "disable_dns_lookups = no"
+fi
+
+# Fallback relay — used when primary delivery (direct or relay) fails
+if [ -n "$FALLBACK_RELAY_HOST" ]; then
+    echo "Configuring fallback relay: $FALLBACK_RELAY_HOST"
+    postconf -e "smtp_fallback_relay = $FALLBACK_RELAY_HOST"
+
+    if [ -n "$FALLBACK_SMTP_USERNAME" ] && [ -n "$FALLBACK_SMTP_PASSWORD" ]; then
+        echo "Configuring fallback relay credentials"
+        # Ensure sasl_passwd exists (may not if primary relay has no credentials)
+        touch /etc/postfix/sasl_passwd
+        echo "${FALLBACK_RELAY_HOST} ${FALLBACK_SMTP_USERNAME}:${FALLBACK_SMTP_PASSWORD}" >> /etc/postfix/sasl_passwd
+        postmap /etc/postfix/sasl_passwd
+        chmod 600 /etc/postfix/sasl_passwd*
+        # Enable SASL if not already enabled (needed for direct mode with fallback)
+        postconf -e "smtp_sasl_auth_enable = yes"
+        postconf -e "smtp_sasl_security_options = noanonymous"
+        postconf -e "smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd"
+    fi
 fi
 
 # Configure SASL for inbound authentication

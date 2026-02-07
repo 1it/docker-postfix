@@ -84,6 +84,9 @@ environment:
 | `RELAY_HOST` | — | External SMTP relay (e.g., `[smtp.gmail.com]:587`) |
 | `SMTP_USERNAME` | — | Relay authentication username |
 | `SMTP_PASSWORD` | — | Relay authentication password |
+| `FALLBACK_RELAY_HOST` | — | Fallback relay when primary delivery fails (e.g., `[backup-smtp.example.com]:587`) |
+| `FALLBACK_SMTP_USERNAME` | — | Fallback relay authentication username |
+| `FALLBACK_SMTP_PASSWORD` | — | Fallback relay authentication password |
 
 ### TLS Settings
 
