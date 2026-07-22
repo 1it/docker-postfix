@@ -179,7 +179,6 @@ Port 80 must be accessible from the internet during certificate issuance. If cer
 | Port | Protocol | Description |
 |------|----------|-------------|
 | 25 | SMTP | Standard mail delivery (direct mode) and receiving |
-| 465 | SMTPS | Implicit TLS submission |
 | 587 | Submission | Authenticated submission with STARTTLS |
 
 ## Cloud Provider Notes

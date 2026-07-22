@@ -25,15 +25,17 @@ mkdir -p ${SSL_POSTFIX_DIR}/certs
 for conf in ${SSL_DIR}/*.cnf.tpl; do
     generated_conf="${conf%.tpl}"
     cp "$conf" "$generated_conf"
+    # Longest tokens first so prefixes (SSL_ORGANIZATION vs
+    # SSL_ORGANIZATIONAL_UNIT) don't clobber each other. DOMAIN last.
     sed -i \
-        -e "s|DOMAIN|${DOMAIN}|g" \
-        -e "s|SSL_COUNTRY|${SSL_COUNTRY}|g" \
-        -e "s|SSL_STATE|${SSL_STATE}|g" \
-        -e "s|SSL_LOCALITY|${SSL_LOCALITY}|g" \
-        -e "s|SSL_ORGANIZATION|${SSL_ORGANIZATION}|g" \
         -e "s|SSL_ORGANIZATIONAL_UNIT|${SSL_ORGANIZATIONAL_UNIT}|g" \
+        -e "s|SSL_ORGANIZATION|${SSL_ORGANIZATION}|g" \
         -e "s|SSL_COMMON_NAME|${SSL_COMMON_NAME}|g" \
+        -e "s|SSL_COUNTRY|${SSL_COUNTRY}|g" \
+        -e "s|SSL_LOCALITY|${SSL_LOCALITY}|g" \
+        -e "s|SSL_STATE|${SSL_STATE}|g" \
         -e "s|SSL_EMAIL|${SSL_EMAIL}|g" \
+        -e "s|DOMAIN|${DOMAIN}|g" \
         "$generated_conf"
 done
 

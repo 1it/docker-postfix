@@ -223,10 +223,13 @@ done
 if [ -n "$DKIM_EXTRA_DOMAINS" ]; then
     for extra_domain in $(echo "$DKIM_EXTRA_DOMAINS" | tr ',' ' '); do
         echo "Adding DKIM signing for extra domain: ${extra_domain}"
-        echo "*@${extra_domain} ${DKIM_SELECTOR}._domainkey.${extra_domain}" >> /etc/opendkim/signing.table
-        echo "${DKIM_SELECTOR}._domainkey.${extra_domain} ${extra_domain}:${DKIM_SELECTOR}:/etc/ssl/dkim/dkim.key" >> /etc/opendkim/key.table
-        echo "${extra_domain}" >> /etc/opendkim/trusted.hosts
-        echo "*.${extra_domain}" >> /etc/opendkim/trusted.hosts
+        signing_line="*@${extra_domain} ${DKIM_SELECTOR}._domainkey.${extra_domain}"
+        key_line="${DKIM_SELECTOR}._domainkey.${extra_domain} ${extra_domain}:${DKIM_SELECTOR}:/etc/ssl/dkim/dkim.key"
+        # Guard appends so restarts don't accumulate duplicate lines
+        grep -qxF "$signing_line" /etc/opendkim/signing.table || echo "$signing_line" >> /etc/opendkim/signing.table
+        grep -qxF "$key_line" /etc/opendkim/key.table || echo "$key_line" >> /etc/opendkim/key.table
+        grep -qxF "${extra_domain}" /etc/opendkim/trusted.hosts || echo "${extra_domain}" >> /etc/opendkim/trusted.hosts
+        grep -qxF "*.${extra_domain}" /etc/opendkim/trusted.hosts || echo "*.${extra_domain}" >> /etc/opendkim/trusted.hosts
     done
 fi
 
@@ -234,7 +237,8 @@ fi
 if [ -f /etc/opendkim/trusted.hosts ]; then
     sed -i '/__MY_NETWORKS_EXPANDED__/d' /etc/opendkim/trusted.hosts
     for network in $(echo "$MY_NETWORKS" | tr ',' ' '); do
-        echo "$network" >> /etc/opendkim/trusted.hosts
+        # Guard appends so restarts don't accumulate duplicate lines
+        grep -qxF "$network" /etc/opendkim/trusted.hosts || echo "$network" >> /etc/opendkim/trusted.hosts
     done
 fi
 

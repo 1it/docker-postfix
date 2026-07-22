@@ -53,7 +53,7 @@ RUN groupadd -g 89 postfix && \
     newaliases && \
     chmod +x /usr/local/bin/certgen.sh /docker-entrypoint.sh
 
-EXPOSE 25/tcp 465/tcp 587/tcp
+EXPOSE 25/tcp 587/tcp
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
 
