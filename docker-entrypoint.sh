@@ -96,22 +96,35 @@ fi
 # TLS certificates — Let's Encrypt or self-signed
 # ============================================================
 if [ -n "$LETSENCRYPT_EMAIL" ] && [ -n "$DOMAIN" ]; then
-    LE_CERT="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-    LE_KEY="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
+    ACME_SH=/opt/acme.sh/acme.sh
+    # State (account + issued certs) lives on the letsencrypt volume so it
+    # survives container recreation and enables renewal without re-registering.
+    ACME_CONFIG=/etc/letsencrypt/acme.sh
+    LE_DIR="/etc/letsencrypt/live/${DOMAIN}"
+    LE_CERT="${LE_DIR}/fullchain.pem"
+    LE_KEY="${LE_DIR}/privkey.pem"
+    mkdir -p "$LE_DIR" "$ACME_CONFIG"
 
     if [ -f "$LE_CERT" ] && [ -f "$LE_KEY" ]; then
         echo "Using existing Let's Encrypt certificates for ${DOMAIN}"
     else
-        echo "Requesting Let's Encrypt certificate for ${DOMAIN}..."
-        # Build certbot domain arguments
-        CERTBOT_DOMAINS="-d ${DOMAIN}"
+        echo "Requesting Let's Encrypt certificate for ${DOMAIN} via acme.sh..."
+        # Build acme.sh domain arguments
+        ACME_DOMAINS="-d ${DOMAIN}"
         if [ -n "$LETSENCRYPT_EXTRA_DOMAINS" ]; then
             for extra_domain in $(echo "$LETSENCRYPT_EXTRA_DOMAINS" | tr ',' ' '); do
-                CERTBOT_DOMAINS="${CERTBOT_DOMAINS} -d ${extra_domain}"
+                ACME_DOMAINS="${ACME_DOMAINS} -d ${extra_domain}"
             done
         fi
-        if certbot certonly --standalone --non-interactive --agree-tos \
-            --email "$LETSENCRYPT_EMAIL" $CERTBOT_DOMAINS; then
+        if "$ACME_SH" --issue --standalone \
+                --config-home "$ACME_CONFIG" \
+                --server letsencrypt \
+                --accountemail "$LETSENCRYPT_EMAIL" \
+                $ACME_DOMAINS && \
+           "$ACME_SH" --install-cert -d "$DOMAIN" \
+                --config-home "$ACME_CONFIG" \
+                --key-file "$LE_KEY" \
+                --fullchain-file "$LE_CERT"; then
             echo "Let's Encrypt certificate obtained successfully"
         else
             echo "Warning: Let's Encrypt failed, falling back to self-signed certificates"

@@ -180,7 +180,7 @@ volumes:
   - letsencrypt:/etc/letsencrypt
 ```
 
-Port 80 must be accessible from the internet during certificate issuance. If certbot fails, the container falls back to self-signed certificates.
+Certificates are issued with [acme.sh](https://github.com/acmesh-official/acme.sh) (HTTP-01, standalone), so port 80 must be accessible from the internet during issuance. Mount the `letsencrypt` volume to persist the acme.sh account and certificates across restarts. If issuance fails, the container falls back to self-signed certificates.
 
 ## Volumes
 

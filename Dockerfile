@@ -3,6 +3,7 @@ FROM debian:bookworm-slim AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
     openssl \
     postfix \
@@ -11,8 +12,15 @@ RUN apt-get update && \
     sasl2-bin \
     opendkim \
     opendkim-tools \
-    certbot \
-    ca-certificates
+    curl \
+    socat \
+    ca-certificates && \
+    # acme.sh replaces certbot: a single shell script with no Python
+    # dependency stack (removes the urllib3/cryptography CVE surface).
+    curl -fsSL https://github.com/acmesh-official/acme.sh/archive/refs/heads/master.tar.gz -o /tmp/acme.tar.gz && \
+    mkdir -p /tmp/acme && tar xzf /tmp/acme.tar.gz -C /tmp/acme --strip-components=1 && \
+    (cd /tmp/acme && ./acme.sh --install --home /opt/acme.sh --nocron --noprofile) && \
+    rm -rf /tmp/acme /tmp/acme.tar.gz /var/lib/apt/lists/*
 
 FROM debian:bookworm-slim
 
@@ -25,6 +33,10 @@ COPY --from=builder /etc/postfix /etc/postfix
 COPY --from=builder /etc/ssl/ /etc/ssl/
 COPY --from=builder /etc/alternatives /etc/alternatives
 COPY --from=builder /etc/ca-certificates.conf /etc/ca-certificates.conf
+COPY --from=builder /opt/acme.sh /opt/acme.sh
+
+# Patch base packages (glibc, perl-base, etc.) registered in the slim base
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 
 # Postfix configuration
 COPY config/main.cf /etc/postfix/main.cf
