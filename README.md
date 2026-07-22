@@ -13,7 +13,7 @@ Lightweight Postfix mail relay with built-in DKIM signing, TLS support, and flex
 - **DKIM signing** — embedded OpenDKIM with automatic key generation
 - **TLS** — auto-generated self-signed certs or Let's Encrypt
 - **Configurable** — all settings via environment variables
-- **Minimal** — multi-stage Debian Bookworm build
+- **Minimal** — multi-stage Debian Trixie build
 - **Multi-arch** — `linux/amd64` and `linux/arm64`
 
 ## Quick Start

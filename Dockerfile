@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim AS builder
+FROM debian:trixie-slim AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -22,7 +22,7 @@ RUN apt-get update && \
     (cd /tmp/acme && ./acme.sh --install --home /opt/acme.sh --nocron --noprofile) && \
     rm -rf /tmp/acme /tmp/acme.tar.gz /var/lib/apt/lists/*
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 COPY --from=builder /usr/lib /usr/lib
 COPY --from=builder /usr/bin /usr/bin

@@ -183,7 +183,6 @@ if [ -n "$RELAY_HOST" ]; then
 else
     echo "=== DIRECT MODE: delivering mail directly to recipient MX servers ==="
     postconf -e "smtp_tls_security_level = may"
-    postconf -e "disable_dns_lookups = no"
 fi
 
 # Fallback relay — used when primary delivery (direct or relay) fails

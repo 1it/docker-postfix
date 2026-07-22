@@ -11,9 +11,6 @@ inet_interfaces = all
 inet_protocols = ipv4
 recipient_delimiter = +
 
-# DNS — enabled for direct MX delivery (default mode)
-disable_dns_lookups = no
-
 # TLS parameters for outbound SMTP (client)
 # "may" = opportunistic TLS (required for direct delivery over port 25)
 # Overridden to "encrypt" when RELAY_HOST is set
