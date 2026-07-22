@@ -22,6 +22,7 @@ subjectAltName = @alt_names
 DNS.1 = DOMAIN
 DNS.2 = mail.DOMAIN
 DNS.3 = smtp.DOMAIN
+DNS.4 = MAILNAME
 
 [ cert_type ]
 nsCertType = server

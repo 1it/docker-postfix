@@ -8,6 +8,10 @@ MY_NETWORKS=${MY_NETWORKS:-"127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 DKIM_SELECTOR=${DKIM_SELECTOR:-"mail"}
 DKIM_KEY_DIR=${DKIM_KEY_DIR:-"/etc/ssl/dkim"}
 
+# Export so child processes (certgen.sh) inherit the resolved values even
+# when the caller did not pass them via -e.
+export MAILNAME DOMAIN
+
 # Function to apply postfix configurations from environment variables
 apply_postfix_config() {
     # Format: POSTFIX_config_name=value
@@ -124,7 +128,8 @@ if [ -n "$LETSENCRYPT_EMAIL" ] && [ -n "$DOMAIN" ]; then
            "$ACME_SH" --install-cert -d "$DOMAIN" \
                 --config-home "$ACME_CONFIG" \
                 --key-file "$LE_KEY" \
-                --fullchain-file "$LE_CERT"; then
+                --fullchain-file "$LE_CERT" \
+                --reloadcmd "postfix reload"; then
             echo "Let's Encrypt certificate obtained successfully"
         else
             echo "Warning: Let's Encrypt failed, falling back to self-signed certificates"
@@ -320,10 +325,23 @@ echo "Starting OpenDKIM..."
 opendkim -x /etc/opendkim.conf -f -l &
 OPENDKIM_PID=$!
 
-# Signal handling: clean up both processes on shutdown
+# Let's Encrypt auto-renewal: acme.sh --cron renews certs nearing expiry
+# and runs the stored reloadcmd (postfix reload) on success.
+RENEW_PID=""
+if [ -n "$LETSENCRYPT_EMAIL" ] && [ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]; then
+    echo "Starting Let's Encrypt renewal loop..."
+    ( while true; do
+        sleep 12h
+        /opt/acme.sh/acme.sh --cron --config-home /etc/letsencrypt/acme.sh
+      done ) &
+    RENEW_PID=$!
+fi
+
+# Signal handling: clean up background processes on shutdown
 cleanup() {
     echo "Shutting down..."
     kill "$OPENDKIM_PID" 2>/dev/null
+    [ -n "$RENEW_PID" ] && kill "$RENEW_PID" 2>/dev/null
     wait "$OPENDKIM_PID" 2>/dev/null
     exit 0
 }

@@ -6,12 +6,14 @@ echo "Starting certificate generation for ${DOMAIN}..."
 
 # Default values
 DOMAIN=${DOMAIN:-"mail.example.com"}
+MAILNAME=${MAILNAME:-${DOMAIN}}
 SSL_COUNTRY=${SSL_COUNTRY:-"US"}
 SSL_STATE=${SSL_STATE:-"State"}
 SSL_LOCALITY=${SSL_LOCALITY:-"City"}
 SSL_ORGANIZATION=${SSL_ORGANIZATION:-"Organization"}
 SSL_ORGANIZATIONAL_UNIT=${SSL_ORGANIZATIONAL_UNIT:-"IT"}
-SSL_COMMON_NAME=${SSL_COMMON_NAME:-${DOMAIN}}
+# Identify the mail host: prefer MAILNAME (postfix myhostname) over DOMAIN
+SSL_COMMON_NAME=${SSL_COMMON_NAME:-${MAILNAME:-${DOMAIN}}}
 SSL_DIR=${SSL_DIR:-"/etc/ssl"}
 SSL_POSTFIX_DIR=${SSL_POSTFIX_DIR:-"/etc/ssl/postfix"}
 
@@ -35,6 +37,7 @@ for conf in ${SSL_DIR}/*.cnf.tpl; do
         -e "s|SSL_LOCALITY|${SSL_LOCALITY}|g" \
         -e "s|SSL_STATE|${SSL_STATE}|g" \
         -e "s|SSL_EMAIL|${SSL_EMAIL}|g" \
+        -e "s|MAILNAME|${MAILNAME}|g" \
         -e "s|DOMAIN|${DOMAIN}|g" \
         "$generated_conf"
 done
