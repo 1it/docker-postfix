@@ -197,6 +197,34 @@ mech_list: PLAIN LOGIN
 EOF
 fi
 
+# Provision SASL users for authenticated submission (port 587).
+# Format: SMTP_AUTH_USERS=user1:pass1,user2:pass2
+# Clients authenticate with the bare username and the realm $MAILNAME
+# (matches smtpd_sasl_local_domain = $myhostname in main.cf).
+if [ -n "$SMTP_AUTH_USERS" ]; then
+    echo "Provisioning SASL submission users..."
+    IFS=',' read -ra _auth_pairs <<< "$SMTP_AUTH_USERS"
+    for pair in "${_auth_pairs[@]}"; do
+        case "$pair" in
+            *:*) ;;
+            *) echo "Warning: skipping malformed SMTP_AUTH_USERS entry (expected user:pass)"; continue ;;
+        esac
+        auth_user="${pair%%:*}"
+        auth_pass="${pair#*:}"
+        if [ -z "$auth_user" ]; then
+            echo "Warning: skipping SMTP_AUTH_USERS entry with empty username"
+            continue
+        fi
+        echo "Adding SASL user: $auth_user"
+        echo "$auth_pass" | saslpasswd2 -p -c -u "$MAILNAME" "$auth_user"
+    done
+    # smtpd runs as the postfix user and must be able to read the sasldb
+    if [ -f /etc/sasldb2 ]; then
+        chown root:postfix /etc/sasldb2
+        chmod 640 /etc/sasldb2
+    fi
+fi
+
 # Apply custom Postfix configurations from environment variables
 echo "Applying custom Postfix configurations..."
 apply_postfix_config

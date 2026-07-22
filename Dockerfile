@@ -8,6 +8,7 @@ RUN apt-get update && \
     postfix \
     netcat-traditional \
     libsasl2-modules \
+    sasl2-bin \
     opendkim \
     opendkim-tools \
     certbot \

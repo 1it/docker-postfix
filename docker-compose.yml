@@ -12,6 +12,8 @@ services:
       - MAILNAME=mail.example.com
       - MY_NETWORKS=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
       - DKIM_SELECTOR=mail
+      # --- Uncomment to allow external authenticated submission on 587 ---
+      # - SMTP_AUTH_USERS=alice:s3cret,bob:hunter2
       # --- Uncomment for relay mode ---
       # - RELAY_HOST=[smtp.example.com]:587
       # - SMTP_USERNAME=your-username
