@@ -12,12 +12,9 @@ services:
       - MAILNAME=mail.example.com
       - MY_NETWORKS=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
       - DKIM_SELECTOR=mail
-      # --- Uncomment to allow external authenticated submission on 587 ---
-      # - SMTP_AUTH_USERS=alice:s3cret,bob:hunter2
-      # --- Uncomment for relay mode ---
-      # - RELAY_HOST=[smtp.example.com]:587
-      # - SMTP_USERNAME=your-username
-      # - SMTP_PASSWORD=your-password
+      # Authenticated submission (587) and relay passwords belong in a
+      # gitignored .env, then referenced here as ${SMTP_AUTH_USERS},
+      # ${SMTP_USERNAME}, and ${SMTP_PASSWORD}. Do not commit them.
       # --- Uncomment for Let's Encrypt (requires port 80 accessible) ---
       # - LETSENCRYPT_EMAIL=admin@example.com
       # --- Optional: self-signed certificate settings ---

@@ -51,11 +51,14 @@ Requirements:
 
 Mail is forwarded through an external SMTP provider. Activated by setting `RELAY_HOST`.
 
+Keep `SMTP_USERNAME` and `SMTP_PASSWORD` in a gitignored `.env` file and
+reference them from Compose. Do not write passwords into `docker-compose.yml`.
+
 ```yaml
 environment:
-  - RELAY_HOST=[smtp.example.com]:587
-  - SMTP_USERNAME=your-username
-  - SMTP_PASSWORD=your-password
+  RELAY_HOST: "[smtp.example.com]:587"
+  SMTP_USERNAME: ${SMTP_USERNAME}
+  SMTP_PASSWORD: ${SMTP_PASSWORD}
 ```
 
 ### Authenticated Submission
@@ -64,16 +67,29 @@ Port 587 always requires a SASL account from `SMTP_AUTH_USERS`, including
 clients inside `MY_NETWORKS`. Trusted networks can still relay without a
 login on port 25.
 
-```yaml
-environment:
-  - SMTP_AUTH_USERS=alice:s3cret,bob:hunter2
-ports:
-  - "587:587"
+Store the account list in a gitignored `.env` (mode `600`). Compose
+substitutes `${SMTP_AUTH_USERS}` from that file. The password still reaches
+the container as an environment variable, so `docker inspect` can show it;
+the value does not belong in the compose file, the image, or git. A comma
+separates accounts. A password must not contain a comma.
+
+```bash
+# .env
+SMTP_AUTH_USERS=alice:<long-random-secret>
 ```
 
-Clients authenticate over STARTTLS with the bare username (e.g. `alice`) and
-password. Accounts are re-provisioned from the environment on every start, so
-update the variable and recreate the container to change credentials.
+```yaml
+services:
+  postfix:
+    environment:
+      SMTP_AUTH_USERS: ${SMTP_AUTH_USERS:?set SMTP_AUTH_USERS in .env}
+    ports:
+      - "587:587"
+```
+
+Clients authenticate over STARTTLS with the bare username (for example
+`alice`) and the password from `.env`. Accounts are re-provisioned on every
+start, so change `.env` and recreate the container to rotate credentials.
 
 ## Configuration
 
@@ -85,7 +101,7 @@ update the variable and recreate the container to change credentials.
 | `MAILNAME` | `mail.example.com` | Postfix hostname (`myhostname`) and Let's Encrypt certificate name |
 | `MY_NETWORKS` | `127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` | Trusted networks allowed to relay on port 25 |
 | `MY_DESTINATION_DOMAINS` | — | Additional local destination domains |
-| `SMTP_AUTH_USERS` | — | Submission (587) login accounts, `user1:pass1,user2:pass2` |
+| `SMTP_AUTH_USERS` | — | Submission (587) accounts, `user:password` pairs separated by commas. Set this in a gitignored env file. |
 
 ### DKIM Settings
 
@@ -216,6 +232,7 @@ If port 25 is blocked, use relay mode with an external SMTP provider.
 - High-strength ciphers only
 - DKIM signing for outbound mail
 - Port 587 requires a SASL account from `SMTP_AUTH_USERS` over STARTTLS. Port 25 still relays for `MY_NETWORKS` without a login.
+- Submission and relay passwords stay in a gitignored `.env`. Do not commit them in Compose files or the image.
 - Proper sender/recipient restrictions
 - Minimal base image
 
