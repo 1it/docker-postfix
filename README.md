@@ -60,8 +60,9 @@ environment:
 
 ### Authenticated Submission
 
-By default, only clients inside `MY_NETWORKS` may send mail. To let external
-clients submit over port 587, provision SASL accounts with `SMTP_AUTH_USERS`:
+Port 587 always requires a SASL account from `SMTP_AUTH_USERS`, including
+clients inside `MY_NETWORKS`. Trusted networks can still relay without a
+login on port 25.
 
 ```yaml
 environment:
@@ -82,7 +83,7 @@ update the variable and recreate the container to change credentials.
 |----------|---------|-------------|
 | `DOMAIN` | `example.com` | Domain for DKIM signing |
 | `MAILNAME` | `mail.example.com` | Postfix hostname (`myhostname`) and Let's Encrypt certificate name |
-| `MY_NETWORKS` | `127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` | Trusted networks allowed to relay |
+| `MY_NETWORKS` | `127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` | Trusted networks allowed to relay on port 25 |
 | `MY_DESTINATION_DOMAINS` | — | Additional local destination domains |
 | `SMTP_AUTH_USERS` | — | Submission (587) login accounts, `user1:pass1,user2:pass2` |
 
@@ -214,7 +215,7 @@ If port 25 is blocked, use relay mode with an external SMTP provider.
 - TLS 1.2+ enforced (SSLv2, SSLv3, TLSv1, TLSv1.1 disabled)
 - High-strength ciphers only
 - DKIM signing for outbound mail
-- SASL-authenticated submission (opt-in via `SMTP_AUTH_USERS`); otherwise submission is restricted to `MY_NETWORKS`
+- Port 587 requires a SASL account from `SMTP_AUTH_USERS` over STARTTLS. Port 25 still relays for `MY_NETWORKS` without a login.
 - Proper sender/recipient restrictions
 - Minimal base image
 
