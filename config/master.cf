@@ -5,7 +5,14 @@ smtp      inet  n       -       n       -       -       smtpd
 submission inet n       -       n       -       -       smtpd
   -o smtpd_tls_security_level=encrypt
   -o smtpd_sasl_auth_enable=yes
+  -o smtpd_tls_auth_only=yes
+  # main.cf sets smtpd_delay_reject=no, which applies this reject at connect,
+  # before AUTH. Delay it so the password can be checked first.
+  # mynetworks is not consulted here; SASL is the only way in.
+  -o smtpd_delay_reject=yes
   -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+  -o smtpd_relay_restrictions=permit_sasl_authenticated,reject
+  -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject
 
 # Internal postfix services
 pickup    unix  n       -       n       60      1       pickup

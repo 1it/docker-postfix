@@ -80,8 +80,8 @@ update the variable and recreate the container to change credentials.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DOMAIN` | `example.com` | Domain for DKIM signing and certificate generation |
-| `MAILNAME` | `mail.example.com` | Postfix hostname (`myhostname`) |
+| `DOMAIN` | `example.com` | Domain for DKIM signing |
+| `MAILNAME` | `mail.example.com` | Postfix hostname (`myhostname`) and Let's Encrypt certificate name |
 | `MY_NETWORKS` | `127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` | Trusted networks allowed to relay |
 | `MY_DESTINATION_DOMAINS` | — | Additional local destination domains |
 | `SMTP_AUTH_USERS` | — | Submission (587) login accounts, `user1:pass1,user2:pass2` |
@@ -171,7 +171,8 @@ For production use, real TLS certificates improve deliverability. Set `LETSENCRY
 ```yaml
 environment:
   - LETSENCRYPT_EMAIL=admin@example.com
-  - DOMAIN=example.com
+  - MAILNAME=mail.example.com
+  - LETSENCRYPT_EXTRA_DOMAINS=smtp.example.com
 ports:
   - "80:80"    # Required for HTTP-01 challenge
   - "25:25"
@@ -180,7 +181,7 @@ volumes:
   - letsencrypt:/etc/letsencrypt
 ```
 
-Certificates are issued with [acme.sh](https://github.com/acmesh-official/acme.sh) (HTTP-01, standalone), so port 80 must be accessible from the internet during issuance. Mount the `letsencrypt` volume to persist the acme.sh account and certificates across restarts. If issuance fails, the container falls back to self-signed certificates.
+The certificate is issued for `MAILNAME`, plus any `LETSENCRYPT_EXTRA_DOMAINS`. `DOMAIN` is not added automatically: it is the DKIM domain, and HTTP-01 fails when that name is behind a CDN. Every name on the certificate must have DNS that reaches this host on port 80 and must not be proxied. Certificates are issued with [acme.sh](https://github.com/acmesh-official/acme.sh) (HTTP-01, standalone). Mount the `letsencrypt` volume to persist the acme.sh account and certificates across restarts. If issuance fails, the container falls back to self-signed certificates.
 
 ## Volumes
 

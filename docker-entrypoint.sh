@@ -99,33 +99,42 @@ fi
 # ============================================================
 # TLS certificates — Let's Encrypt or self-signed
 # ============================================================
-if [ -n "$LETSENCRYPT_EMAIL" ] && [ -n "$DOMAIN" ]; then
+# HTTP-01 standalone can only succeed for names that resolve to this host.
+# DOMAIN is the DKIM signing domain and is often a site behind a CDN, so the
+# certificate is issued for MAILNAME (the name SMTP clients connect to).
+LE_PRIMARY="${MAILNAME:-$DOMAIN}"
+if [ -n "$LETSENCRYPT_EMAIL" ] && [ -n "$LE_PRIMARY" ]; then
     ACME_SH=/opt/acme.sh/acme.sh
     # State (account + issued certs) lives on the letsencrypt volume so it
     # survives container recreation and enables renewal without re-registering.
     ACME_CONFIG=/etc/letsencrypt/acme.sh
-    LE_DIR="/etc/letsencrypt/live/${DOMAIN}"
+    LE_DIR="/etc/letsencrypt/live/${LE_PRIMARY}"
     LE_CERT="${LE_DIR}/fullchain.pem"
     LE_KEY="${LE_DIR}/privkey.pem"
     mkdir -p "$LE_DIR" "$ACME_CONFIG"
 
     if [ -f "$LE_CERT" ] && [ -f "$LE_KEY" ]; then
-        echo "Using existing Let's Encrypt certificates for ${DOMAIN}"
+        echo "Using existing Let's Encrypt certificates for ${LE_PRIMARY}"
     else
-        echo "Requesting Let's Encrypt certificate for ${DOMAIN} via acme.sh..."
-        # Build acme.sh domain arguments
-        ACME_DOMAINS="-d ${DOMAIN}"
+        # Build acme.sh domain arguments. Skip DOMAIN unless it is MAILNAME
+        # or explicitly listed in LETSENCRYPT_EXTRA_DOMAINS.
+        ACME_DOMAINS="-d ${LE_PRIMARY}"
         if [ -n "$LETSENCRYPT_EXTRA_DOMAINS" ]; then
             for extra_domain in $(echo "$LETSENCRYPT_EXTRA_DOMAINS" | tr ',' ' '); do
+                if [ "$extra_domain" = "$LE_PRIMARY" ]; then
+                    continue
+                fi
                 ACME_DOMAINS="${ACME_DOMAINS} -d ${extra_domain}"
             done
         fi
+        echo "Requesting Let's Encrypt certificate via HTTP-01 for: ${ACME_DOMAINS}"
+        echo "Each name must resolve to this host on port 80 and must not be proxied by a CDN."
         if "$ACME_SH" --issue --standalone \
                 --config-home "$ACME_CONFIG" \
                 --server letsencrypt \
                 --accountemail "$LETSENCRYPT_EMAIL" \
                 $ACME_DOMAINS && \
-           "$ACME_SH" --install-cert -d "$DOMAIN" \
+           "$ACME_SH" --install-cert -d "$LE_PRIMARY" \
                 --config-home "$ACME_CONFIG" \
                 --key-file "$LE_KEY" \
                 --fullchain-file "$LE_CERT" \
@@ -327,7 +336,7 @@ OPENDKIM_PID=$!
 # Let's Encrypt auto-renewal: acme.sh --cron renews certs nearing expiry
 # and runs the stored reloadcmd (postfix reload) on success.
 RENEW_PID=""
-if [ -n "$LETSENCRYPT_EMAIL" ] && [ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]; then
+if [ -n "$LETSENCRYPT_EMAIL" ] && [ -n "$LE_PRIMARY" ] && [ -f "/etc/letsencrypt/live/${LE_PRIMARY}/fullchain.pem" ]; then
     echo "Starting Let's Encrypt renewal loop..."
     ( while true; do
         sleep 12h
