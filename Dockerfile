@@ -14,6 +14,7 @@ RUN apt-get update && \
     opendkim-tools \
     curl \
     socat \
+    util-linux \
     ca-certificates && \
     # acme.sh replaces certbot: a single shell script with no Python
     # dependency stack (removes the urllib3/cryptography CVE surface).
@@ -50,6 +51,9 @@ COPY config/opendkim/ /etc/opendkim/
 COPY certs/ca-openssl.cnf.tpl /etc/ssl/
 COPY certs/postfix-openssl.cnf.tpl /etc/ssl/
 COPY certs/certgen.sh /usr/local/bin/
+# Publishes an externally supplied or acme.sh-issued certificate/key pair as
+# one combined PEM; also used as the acme.sh --reloadcmd.
+COPY certs/tls-publish.sh /usr/local/bin/
 
 COPY docker-entrypoint.sh /
 
@@ -64,7 +68,7 @@ RUN groupadd -g 89 postfix && \
     chown opendkim:opendkim /var/run/opendkim /etc/ssl/dkim && \
     touch /etc/aliases && \
     newaliases && \
-    chmod +x /usr/local/bin/certgen.sh /docker-entrypoint.sh
+    chmod +x /usr/local/bin/certgen.sh /usr/local/bin/tls-publish.sh /docker-entrypoint.sh
 
 EXPOSE 25/tcp 587/tcp
 
