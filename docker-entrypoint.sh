@@ -137,6 +137,7 @@ TLS_WATCH=0             # watch the external pair for changes
 TLS_EXPLICIT=0          # TLS_CERT_FILE/TLS_KEY_FILE were supplied by the operator
 LE_RENEWAL_READY=0      # existing acme.sh hook was successfully registered
 TLS_SKIP_ISSUANCE=0      # a failed restore must fall back rather than re-issue
+TLS_ECC_OPT=""          # acme.sh key variant selected for this certificate
 
 # Print the acme.sh key-type option for a certificate managed in this
 # container. It stores RSA state under <config-home>/<domain>/ and EC state
@@ -357,6 +358,7 @@ if [ -z "$TLS_MODE" ] && [ "$TLS_EXPLICIT" = "0" ] && [ "$TLS_SKIP_ISSUANCE" = "
         TLS_MODE=letsencrypt
         TLS_SOURCE_CERT="$LE_CERT"
         TLS_SOURCE_KEY="$LE_KEY"
+        TLS_ECC_OPT="--ecc"
         LE_RENEWAL_READY=1
     else
         echo "Warning: Let's Encrypt failed, falling back to self-signed certificates"
@@ -583,14 +585,34 @@ OPENDKIM_PID=$!
 
 BG_PIDS=()
 
-# Let's Encrypt auto-renewal: acme.sh --cron renews certs nearing expiry
-# and runs the stored --reloadcmd (tls-publish.sh) on success.
+# Let's Encrypt auto-renewal: acme.sh --renew checks only the selected
+# hostname/key variant and runs its stored --reloadcmd (tls-publish.sh) if due.
 if [ "$TLS_MODE" = "letsencrypt" ] && [ "$LE_RENEWAL_READY" = "1" ] && [ -n "$LE_PRIMARY" ] && [ -f "$LE_CERT" ]; then
     echo "Starting Let's Encrypt renewal loop..."
-    ( while true; do
+    (
+      # Renew only the selected hostname and key variant. --cron renews every
+      # domain under ACME_CONFIG, and every stored publisher hook points at the
+      # same TLS_CHAIN_FILE; renewing a different old domain could replace the
+      # certificate currently selected for this container.
+      ACME_RENEW_ARGS=(--renew -d "$LE_PRIMARY" --config-home "$ACME_CONFIG")
+      if [ "$TLS_ECC_OPT" = "--ecc" ]; then
+          ACME_RENEW_ARGS+=(--ecc)
+      fi
+      while true; do
         sleep 12h
-        /opt/acme.sh/acme.sh --cron --config-home /etc/letsencrypt/acme.sh
-      done ) &
+        if "$ACME_SH" "${ACME_RENEW_ARGS[@]}"; then
+            :
+        else
+            RENEW_STATUS=$?
+            # acme.sh returns 2 when the selected certificate is not due yet.
+            if [ "$RENEW_STATUS" -eq 2 ]; then
+                echo "Let's Encrypt certificate for ${LE_PRIMARY} is not due for renewal"
+            else
+                echo "Warning: Let's Encrypt renewal check for ${LE_PRIMARY} failed with status ${RENEW_STATUS}"
+            fi
+        fi
+      done
+    ) &
     BG_PIDS+=("$!")
 fi
 

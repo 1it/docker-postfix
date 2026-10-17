@@ -56,7 +56,7 @@ tls_validate_pair() {
 
     # Postfix loads at most one key per algorithm from smtpd_tls_chain_files, so
     # a bundle holding several keys is refused instead of silently mis-paired.
-    if count=$(grep -c -E '^-----BEGIN ((RSA|EC|DSA|ENCRYPTED) )?PRIVATE KEY-----$' "$key" 2>/dev/null); then
+    if count=$(grep -c -E '^-----BEGIN ((RSA|EC|DSA|ENCRYPTED) )?PRIVATE KEY-----[[:space:]]*$' "$key" 2>/dev/null); then
         :
     else
         grep_status=$?
@@ -146,6 +146,19 @@ tls_validate_pair() {
     return 0
 }
 
+# Serialize a key and full chain into one Postfix PEM. Always add a line break
+# between the key and certificate, since a valid key file need not end in one.
+# Used for both the installed fingerprint and the actual published file so
+# those byte streams remain identical.
+tls_serialize_pair() {
+    local key="$1" cert="$2" output="$3"
+    ( umask 077
+      cat "$key" > "$output" &&
+      printf '\n' >> "$output" &&
+      cat "$cert" >> "$output"
+    ) 2>/dev/null
+}
+
 # Fingerprint of a certificate and key pair, empty when a file is missing or
 # unreadable. Content-based, so a renewal that preserves mtime is detected.
 #
@@ -163,7 +176,7 @@ tls_pair_fingerprint() {
         tls_remove_temp_path "$temp"
         return 1
     fi
-    if ! cat "$key" "$cert" > "$temp" 2>/dev/null; then
+    if ! tls_serialize_pair "$key" "$cert" "$temp"; then
         echo "Warning: unable to read source pair while fingerprinting" >&2
         tls_remove_temp_path "$temp"
         return 1
@@ -273,8 +286,20 @@ tls_publish_pair_locked() {
         return 1
     fi
     # Key first, then the chain, in the file Postfix reads.
-    if ! ( umask 077; cat "$gen/privkey.pem" "$gen/fullchain.pem" > "$gen/tls.pem" ) 2>/dev/null; then
+    if ! tls_serialize_pair "$gen/privkey.pem" "$gen/fullchain.pem" "$gen/tls.pem"; then
         echo "  could not assemble the combined PEM"
+        tls_remove_temp_path "$gen"
+        return 1
+    fi
+    # Validate what Postfix will actually read, not only the separate staged
+    # inputs. This catches concatenation/PEM framing errors before activation.
+    if ! openssl pkey -in "$gen/tls.pem" -noout >/dev/null 2>&1; then
+        echo "  the assembled PEM does not contain a readable private key"
+        tls_remove_temp_path "$gen"
+        return 1
+    fi
+    if ! openssl x509 -in "$gen/tls.pem" -noout >/dev/null 2>&1; then
+        echo "  the assembled PEM does not contain a readable certificate chain"
         tls_remove_temp_path "$gen"
         return 1
     fi
