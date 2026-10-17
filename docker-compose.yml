@@ -18,12 +18,11 @@ services:
       # --- Uncomment for Let's Encrypt (requires port 80 accessible) ---
       # - LETSENCRYPT_EMAIL=admin@example.com
       # --- Or use a certificate issued outside the container. Mount the
-      # --- directory holding the pair and point these at it; the container
-      # --- reloads Postfix when the files change on disk.
-      # - TLS_CERT_FILE=/certs/fullchain.pem
-      # - TLS_KEY_FILE=/certs/privkey.pem
-      # volumes:
-      #   - /srv/letsencrypt/live/mail.example.com:/certs:ro
+      # --- directory holding the pair (see the volumes section below) and
+      # --- point these at it; the container reloads Postfix when the files
+      # --- change on disk.
+      # - TLS_CERT_FILE=/certs/live/mail.example.com/fullchain.pem
+      # - TLS_KEY_FILE=/certs/live/mail.example.com/privkey.pem
       # --- Optional: self-signed certificate settings ---
       # - SSL_COUNTRY=US
       # - SSL_STATE=California
@@ -38,6 +37,9 @@ services:
       - postfix_certs:/etc/ssl/postfix
       - dkim_keys:/etc/ssl/dkim
       # - letsencrypt:/etc/letsencrypt
+      # Externally issued certificate: mount the root of the tree so relative
+      # symlinks inside live/ resolve (certbot points at ../../archive/).
+      # - /srv/letsencrypt:/certs:ro
     restart: unless-stopped
 
 volumes:
