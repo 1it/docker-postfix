@@ -11,7 +11,7 @@ Lightweight Postfix mail relay with built-in DKIM signing, TLS support, and flex
 - **Direct delivery** — send mail directly to recipient MX servers (default)
 - **Relay mode** — forward mail through an external SMTP provider (AWS SES, Gmail, etc.)
 - **DKIM signing** — embedded OpenDKIM with automatic key generation
-- **TLS** — auto-generated self-signed certs or Let's Encrypt
+- **TLS** — auto-generated self-signed certs, Let's Encrypt, or certificates you provide
 - **Configurable** — all settings via environment variables
 - **Minimal** — multi-stage Debian Trixie build
 - **Multi-arch** — `linux/amd64` and `linux/arm64`
@@ -128,6 +128,9 @@ start, so change `.env` and recreate the container to rotate credentials.
 |----------|---------|-------------|
 | `LETSENCRYPT_EMAIL` | — | Enables Let's Encrypt; email for account registration |
 | `LETSENCRYPT_EXTRA_DOMAINS` | — | Comma-separated extra domains for the certificate (SANs) |
+| `TLS_CERT_FILE` | — | Path to an existing certificate (full chain) inside the container; disables Let's Encrypt issuance |
+| `TLS_KEY_FILE` | — | Path to the matching private key; must be set together with `TLS_CERT_FILE` |
+| `TLS_WATCH_INTERVAL` | `300` | Seconds between checks for changes to `TLS_CERT_FILE`/`TLS_KEY_FILE`; `0` checks only at startup |
 | `SSL_COUNTRY` | `US` | Self-signed certificate country |
 | `SSL_STATE` | `State` | Self-signed certificate state |
 | `SSL_LOCALITY` | `City` | Self-signed certificate locality |
@@ -200,14 +203,39 @@ volumes:
 
 The certificate is issued for `MAILNAME`, plus any `LETSENCRYPT_EXTRA_DOMAINS`. `DOMAIN` is not added automatically: it is the DKIM domain, and HTTP-01 fails when that name is behind a CDN. Every name on the certificate must have DNS that reaches this host on port 80 and must not be proxied. Certificates are issued with [acme.sh](https://github.com/acmesh-official/acme.sh) (HTTP-01, standalone). Mount the `letsencrypt` volume to persist the acme.sh account and certificates across restarts. If issuance fails, the container falls back to self-signed certificates.
 
+## External Certificates
+
+Certificates obtained outside the container work too, so an existing acme.sh, certbot, or commercial CA setup on the host can be reused instead of the built-in issuance. Point `TLS_CERT_FILE` and `TLS_KEY_FILE` at the mounted files:
+
+```yaml
+environment:
+  - MAILNAME=mail.example.com
+  - TLS_CERT_FILE=/certs/fullchain.pem
+  - TLS_KEY_FILE=/certs/privkey.pem
+volumes:
+  - /srv/letsencrypt/live/mail.example.com:/certs:ro
+```
+
+Port 80 is not needed and `LETSENCRYPT_EMAIL` is not used; when both are set, the external certificate wins and issuance is skipped. The files must be a matching certificate/key pair in PEM format. Anything else works as a source: a commercial certificate, a Kubernetes secret, or a directory managed by an external client.
+
+How they are used:
+
+- **Read at startup** — the pair is validated (parses as PEM, certificate and key belong together), its subject and expiry date are logged, and a warning is printed when it expires within 7 days.
+- **Copied into the image** — the pair is copied to `/etc/ssl/postfix/tls/` with `root:postfix` ownership. A bind-mounted key is often mode `0600` owned by a host user that the Postfix user cannot read; the copy keeps TLS working regardless.
+- **Watched for renewal** — every `TLS_WATCH_INTERVAL` seconds the files are compared by content. On a change the new pair is validated, copied, and Postfix is reloaded, so a host-side renewal takes effect without restarting the container. Writes go through temporary files, and an unreadable or invalid new pair is ignored while the last good one keeps serving.
+
+Certificates already sitting in the standard layout `/etc/letsencrypt/live/<MAILNAME>/` are picked up without any variables: mount them there and they are used as external certificates. If the container's own acme.sh state for that name is present (it issued the certificate itself), the built-in renewal loop keeps managing it instead.
+
+If the configured files are missing, unreadable, or not a valid pair, the container logs a warning and falls back to self-signed certificates, as it does when Let's Encrypt fails.
+
 ## Volumes
 
 | Volume | Path | Description |
 |--------|------|-------------|
 | `postfix_data` | `/var/spool/postfix` | Mail queue and spool data |
-| `postfix_certs` | `/etc/ssl/postfix` | Self-signed TLS certificates |
+| `postfix_certs` | `/etc/ssl/postfix` | Self-signed TLS certificates and copies of external certificates |
 | `dkim_keys` | `/etc/ssl/dkim` | DKIM private/public key pair |
-| `letsencrypt` | `/etc/letsencrypt` | Let's Encrypt certificates (optional) |
+| `letsencrypt` | `/etc/letsencrypt` | Let's Encrypt certificates and acme.sh state (optional) |
 
 ## Ports
 

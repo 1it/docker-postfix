@@ -97,63 +97,225 @@ if [ -n "$MY_DESTINATION_DOMAINS" ]; then
 fi
 
 # ============================================================
-# TLS certificates — Let's Encrypt or self-signed
+# TLS certificates — external, Let's Encrypt, or self-signed
 # ============================================================
+# Resolution order:
+#   1. TLS_CERT_FILE + TLS_KEY_FILE — a pair issued and renewed outside the
+#      container (host acme.sh, certbot, a commercial CA, a mounted secret).
+#      The pair is copied into the image and Postfix is reloaded whenever the
+#      source files change, so external renewals need no container restart.
+#   2. /etc/letsencrypt/live/<MAILNAME>/ — the standard acme.sh layout, e.g.
+#      pre-populated by an acme.sh running on the host.
+#   3. LETSENCRYPT_EMAIL — issue and renew in-container with acme.sh.
+#   4. Self-signed certificates.
+ACME_SH=/opt/acme.sh/acme.sh
+# State (account + issued certs) lives on the letsencrypt volume so it
+# survives container recreation and enables renewal without re-registering.
+ACME_CONFIG=/etc/letsencrypt/acme.sh
 # HTTP-01 standalone can only succeed for names that resolve to this host.
 # DOMAIN is the DKIM signing domain and is often a site behind a CDN, so the
 # certificate is issued for MAILNAME (the name SMTP clients connect to).
 LE_PRIMARY="${MAILNAME:-$DOMAIN}"
-if [ -n "$LETSENCRYPT_EMAIL" ] && [ -n "$LE_PRIMARY" ]; then
-    ACME_SH=/opt/acme.sh/acme.sh
-    # State (account + issued certs) lives on the letsencrypt volume so it
-    # survives container recreation and enables renewal without re-registering.
-    ACME_CONFIG=/etc/letsencrypt/acme.sh
-    LE_DIR="/etc/letsencrypt/live/${LE_PRIMARY}"
-    LE_CERT="${LE_DIR}/fullchain.pem"
-    LE_KEY="${LE_DIR}/privkey.pem"
-    mkdir -p "$LE_DIR" "$ACME_CONFIG"
+LE_DIR="/etc/letsencrypt/live/${LE_PRIMARY}"
+LE_CERT="${LE_DIR}/fullchain.pem"
+LE_KEY="${LE_DIR}/privkey.pem"
 
-    if [ -f "$LE_CERT" ] && [ -f "$LE_KEY" ]; then
-        echo "Using existing Let's Encrypt certificates for ${LE_PRIMARY}"
-    else
-        # Build acme.sh domain arguments. Skip DOMAIN unless it is MAILNAME
-        # or explicitly listed in LETSENCRYPT_EXTRA_DOMAINS.
-        ACME_DOMAINS="-d ${LE_PRIMARY}"
-        if [ -n "$LETSENCRYPT_EXTRA_DOMAINS" ]; then
-            for extra_domain in $(echo "$LETSENCRYPT_EXTRA_DOMAINS" | tr ',' ' '); do
-                if [ "$extra_domain" = "$LE_PRIMARY" ]; then
-                    continue
-                fi
-                ACME_DOMAINS="${ACME_DOMAINS} -d ${extra_domain}"
-            done
-        fi
-        echo "Requesting Let's Encrypt certificate via HTTP-01 for: ${ACME_DOMAINS}"
-        echo "Each name must resolve to this host on port 80 and must not be proxied by a CDN."
-        if "$ACME_SH" --issue --standalone \
-                --config-home "$ACME_CONFIG" \
-                --server letsencrypt \
-                --accountemail "$LETSENCRYPT_EMAIL" \
-                $ACME_DOMAINS && \
-           "$ACME_SH" --install-cert -d "$LE_PRIMARY" \
-                --config-home "$ACME_CONFIG" \
-                --key-file "$LE_KEY" \
-                --fullchain-file "$LE_CERT" \
-                --reloadcmd "postfix reload"; then
-            echo "Let's Encrypt certificate obtained successfully"
-        else
-            echo "Warning: Let's Encrypt failed, falling back to self-signed certificates"
-            LETSENCRYPT_EMAIL=""
-        fi
+# Where an external pair is copied inside the container. Postfix runs smtpd as
+# an unprivileged user, and a bind-mounted key is often 0600 owned by a host
+# uid the postfix user cannot read, so the pair is copied with ownership this
+# image controls.
+TLS_STATE_DIR=${TLS_STATE_DIR:-/etc/ssl/postfix/tls}
+TLS_CERT_COPY="${TLS_STATE_DIR}/fullchain.pem"
+TLS_KEY_COPY="${TLS_STATE_DIR}/privkey.pem"
+# How often the external pair is checked for changes, in seconds. 0 disables
+# the check and applies the pair only at startup.
+TLS_WATCH_INTERVAL=${TLS_WATCH_INTERVAL:-300}
+
+TLS_MODE=""             # external | letsencrypt
+TLS_SOURCE_CERT=""      # certificate the container reads from
+TLS_SOURCE_KEY=""       # private key the container reads from
+TLS_WATCH=0             # watch the external pair for changes
+
+# True when this container's own acme.sh installed the certificate for
+# LE_PRIMARY and can therefore renew it.
+acme_manages_domain() {
+    [ -f "${ACME_CONFIG}/${LE_PRIMARY}/${LE_PRIMARY}.cer" ]
+}
+
+# Print a short description of the certificate, warn when it is close to
+# expiry, and fail when the pair cannot be served.
+validate_tls_pair() {
+    local cert="$1" key="$2" cert_hash key_hash subject not_after
+    if [ ! -e "$cert" ]; then
+        echo "  certificate file not found: $cert"
+        return 1
     fi
+    if [ ! -e "$key" ]; then
+        echo "  private key file not found: $key"
+        return 1
+    fi
+    if [ ! -r "$cert" ] || [ ! -r "$key" ]; then
+        echo "  not readable by the container (uid $(id -u)): $cert $key"
+        return 1
+    fi
+    if ! openssl x509 -in "$cert" -noout >/dev/null 2>&1; then
+        echo "  cannot parse PEM certificate: $cert"
+        return 1
+    fi
+    if ! openssl pkey -in "$key" -noout >/dev/null 2>&1; then
+        echo "  cannot parse PEM private key: $key"
+        return 1
+    fi
+    cert_hash=$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null | openssl sha256 2>/dev/null | awk '{print $NF}')
+    key_hash=$(openssl pkey -in "$key" -pubout 2>/dev/null | openssl sha256 2>/dev/null | awk '{print $NF}')
+    if [ -z "$cert_hash" ] || [ -z "$key_hash" ]; then
+        echo "  cannot extract the public key from $cert / $key"
+        return 1
+    fi
+    if [ "$cert_hash" != "$key_hash" ]; then
+        echo "  certificate and private key do not belong to the same pair"
+        return 1
+    fi
+    subject=$(openssl x509 -in "$cert" -noout -subject | sed 's/^subject= *//')
+    not_after=$(openssl x509 -in "$cert" -noout -enddate | sed 's/^notAfter=//')
+    echo "  subject: ${subject:-unknown}"
+    echo "  expires: ${not_after:-unknown}"
+    if ! openssl x509 -in "$cert" -noout -checkend 604800 >/dev/null 2>&1; then
+        echo "  Warning: certificate expires within 7 days or has already expired"
+    fi
+    return 0
+}
 
-    if [ -n "$LETSENCRYPT_EMAIL" ] && [ -f "$LE_CERT" ] && [ -f "$LE_KEY" ]; then
-        postconf -e "smtpd_tls_cert_file = $LE_CERT"
-        postconf -e "smtpd_tls_key_file = $LE_KEY"
+# Fingerprint of the current pair, empty when a file is missing or unreadable.
+# Content-based, so a renewal that preserves mtime is still detected.
+tls_pair_fingerprint() {
+    local cert="$1" key="$2"
+    [ -r "$cert" ] && [ -r "$key" ] || return 1
+    md5sum "$cert" "$key" 2>/dev/null | awk '{print $1}' | tr -d '\n'
+}
+
+# Copy the pair into the container. Writes to temporary files and renames, so
+# Postfix never reads a half-written certificate during a renewal.
+install_external_tls_pair() {
+    local cert="$1" key="$2"
+    mkdir -p "$TLS_STATE_DIR" || return 1
+    cat "$cert" > "${TLS_CERT_COPY}.tmp" 2>/dev/null || { rm -f "${TLS_CERT_COPY}.tmp"; return 1; }
+    if ! cat "$key" > "${TLS_KEY_COPY}.tmp" 2>/dev/null; then
+        rm -f "${TLS_CERT_COPY}.tmp" "${TLS_KEY_COPY}.tmp"
+        return 1
+    fi
+    chown root:postfix "${TLS_CERT_COPY}.tmp" "${TLS_KEY_COPY}.tmp" 2>/dev/null
+    chmod 644 "${TLS_CERT_COPY}.tmp"
+    chmod 640 "${TLS_KEY_COPY}.tmp"
+    mv -f "${TLS_CERT_COPY}.tmp" "$TLS_CERT_COPY"
+    mv -f "${TLS_KEY_COPY}.tmp" "$TLS_KEY_COPY"
+}
+
+# --- 1. Explicit external certificate paths ---------------------------------
+if [ -n "$TLS_CERT_FILE" ] || [ -n "$TLS_KEY_FILE" ]; then
+    echo "TLS_CERT_FILE/TLS_KEY_FILE set, using externally managed certificates"
+    if [ -z "$TLS_CERT_FILE" ] || [ -z "$TLS_KEY_FILE" ]; then
+        echo "Warning: TLS_CERT_FILE and TLS_KEY_FILE must be set together, ignoring them"
+    elif ! validate_tls_pair "$TLS_CERT_FILE" "$TLS_KEY_FILE"; then
+        echo "Warning: unusable external certificate pair, falling back"
+    else
+        TLS_MODE=external
+        TLS_SOURCE_CERT="$TLS_CERT_FILE"
+        TLS_SOURCE_KEY="$TLS_KEY_FILE"
+        if [ -n "$LETSENCRYPT_EMAIL" ]; then
+            echo "LETSENCRYPT_EMAIL is ignored while an external certificate is configured"
+        fi
+        if ! install_external_tls_pair "$TLS_SOURCE_CERT" "$TLS_SOURCE_KEY"; then
+            echo "Warning: could not copy the external certificate into the container, falling back"
+            TLS_MODE=""
+            TLS_SOURCE_CERT=""
+            TLS_SOURCE_KEY=""
+        fi
     fi
 fi
 
-# Fall back to self-signed if no Let's Encrypt
-if [ -z "$LETSENCRYPT_EMAIL" ]; then
+# --- 2. Certificates already present in the standard acme.sh layout ---------
+if [ -z "$TLS_MODE" ] && [ -n "$LE_PRIMARY" ] && [ -e "$LE_CERT" ] && [ -e "$LE_KEY" ]; then
+    if acme_manages_domain; then
+        # Issued by this container earlier; keep the acme.sh renewal path.
+        TLS_MODE=letsencrypt
+        TLS_SOURCE_CERT="$LE_CERT"
+        TLS_SOURCE_KEY="$LE_KEY"
+        echo "Using existing Let's Encrypt certificates for ${LE_PRIMARY}"
+    else
+        # No acme.sh state for this name: the files were placed there by
+        # something outside the container, so treat them as externally renewed.
+        echo "Found certificates at ${LE_DIR} without local acme.sh state"
+        if validate_tls_pair "$LE_CERT" "$LE_KEY" && install_external_tls_pair "$LE_CERT" "$LE_KEY"; then
+            TLS_MODE=external
+            TLS_SOURCE_CERT="$LE_CERT"
+            TLS_SOURCE_KEY="$LE_KEY"
+            echo "Using externally managed certificates from ${LE_DIR}"
+            if [ -n "$LETSENCRYPT_EMAIL" ]; then
+                echo "LETSENCRYPT_EMAIL is ignored while an external certificate is configured"
+            fi
+        else
+            echo "Warning: unusable certificate pair in ${LE_DIR}, falling back"
+        fi
+    fi
+fi
+
+# --- 3. Issue with Let's Encrypt (acme.sh, HTTP-01 standalone) --------------
+if [ -z "$TLS_MODE" ] && [ -n "$LETSENCRYPT_EMAIL" ] && [ -n "$LE_PRIMARY" ]; then
+    mkdir -p "$LE_DIR" "$ACME_CONFIG"
+
+    # Build acme.sh domain arguments. Skip DOMAIN unless it is MAILNAME
+    # or explicitly listed in LETSENCRYPT_EXTRA_DOMAINS.
+    ACME_DOMAINS="-d ${LE_PRIMARY}"
+    if [ -n "$LETSENCRYPT_EXTRA_DOMAINS" ]; then
+        for extra_domain in $(echo "$LETSENCRYPT_EXTRA_DOMAINS" | tr ',' ' '); do
+            if [ "$extra_domain" = "$LE_PRIMARY" ]; then
+                continue
+            fi
+            ACME_DOMAINS="${ACME_DOMAINS} -d ${extra_domain}"
+        done
+    fi
+    echo "Requesting Let's Encrypt certificate via HTTP-01 for: ${ACME_DOMAINS}"
+    echo "Each name must resolve to this host on port 80 and must not be proxied by a CDN."
+    if "$ACME_SH" --issue --standalone \
+            --config-home "$ACME_CONFIG" \
+            --server letsencrypt \
+            --accountemail "$LETSENCRYPT_EMAIL" \
+            $ACME_DOMAINS && \
+       "$ACME_SH" --install-cert -d "$LE_PRIMARY" \
+            --config-home "$ACME_CONFIG" \
+            --key-file "$LE_KEY" \
+            --fullchain-file "$LE_CERT" \
+            --reloadcmd "postfix reload"; then
+        echo "Let's Encrypt certificate obtained successfully"
+        TLS_MODE=letsencrypt
+        TLS_SOURCE_CERT="$LE_CERT"
+        TLS_SOURCE_KEY="$LE_KEY"
+    else
+        echo "Warning: Let's Encrypt failed, falling back to self-signed certificates"
+        LETSENCRYPT_EMAIL=""
+    fi
+fi
+
+# --- Apply the resolved certificate to Postfix ------------------------------
+if [ "$TLS_MODE" = "external" ]; then
+    echo "Configuring Postfix with the external certificate"
+    postconf -e "smtpd_tls_cert_file = $TLS_CERT_COPY"
+    postconf -e "smtpd_tls_key_file = $TLS_KEY_COPY"
+    # Nothing renews an external pair from here, so watch it and reload on change.
+    if [ "$TLS_WATCH_INTERVAL" -gt 0 ] 2>/dev/null; then
+        TLS_WATCH=1
+        echo "Watching ${TLS_SOURCE_CERT} every ${TLS_WATCH_INTERVAL}s for renewals"
+    else
+        echo "TLS_WATCH_INTERVAL is not a positive number, watching is disabled"
+    fi
+elif [ "$TLS_MODE" = "letsencrypt" ]; then
+    postconf -e "smtpd_tls_cert_file = $TLS_SOURCE_CERT"
+    postconf -e "smtpd_tls_key_file = $TLS_SOURCE_KEY"
+fi
+
+# --- 4. Self-signed fallback ------------------------------------------------
+if [ -z "$TLS_MODE" ]; then
     if [ ! -f /etc/ssl/postfix/certs/postfix.crt ] || [ ! -f /etc/ssl/postfix/private/postfix.key ]; then
         echo "Warning: TLS certificates not found"
         echo "Generating self-signed TLS certificates..."
@@ -333,23 +495,59 @@ echo "Starting OpenDKIM..."
 opendkim -x /etc/opendkim.conf -f -l &
 OPENDKIM_PID=$!
 
+BG_PIDS=()
+
 # Let's Encrypt auto-renewal: acme.sh --cron renews certs nearing expiry
 # and runs the stored reloadcmd (postfix reload) on success.
-RENEW_PID=""
-if [ -n "$LETSENCRYPT_EMAIL" ] && [ -n "$LE_PRIMARY" ] && [ -f "/etc/letsencrypt/live/${LE_PRIMARY}/fullchain.pem" ]; then
+if [ "$TLS_MODE" = "letsencrypt" ] && [ -n "$LE_PRIMARY" ] && [ -f "$TLS_SOURCE_CERT" ]; then
     echo "Starting Let's Encrypt renewal loop..."
     ( while true; do
         sleep 12h
         /opt/acme.sh/acme.sh --cron --config-home /etc/letsencrypt/acme.sh
       done ) &
-    RENEW_PID=$!
+    BG_PIDS+=("$!")
+fi
+
+# External certificate watch: the pair is issued and renewed outside the
+# container (host acme.sh, certbot, a mounted secret). Copy the new pair in and
+# reload Postfix so clients pick it up without a container restart. A rejected
+# or unreadable pair is ignored until the next tick, keeping the last good one
+# in service.
+if [ "$TLS_WATCH" = "1" ]; then
+    echo "Starting external certificate watcher..."
+    (
+      TLS_CERT_FINGERPRINT=$(tls_pair_fingerprint "$TLS_SOURCE_CERT" "$TLS_SOURCE_KEY") || TLS_CERT_FINGERPRINT=""
+      while true; do
+        sleep "$TLS_WATCH_INTERVAL"
+        current=$(tls_pair_fingerprint "$TLS_SOURCE_CERT" "$TLS_SOURCE_KEY") || current=""
+        # Empty fingerprint: files are mid-rotation or gone, retry next tick.
+        [ -n "$current" ] || continue
+        [ "$current" != "$TLS_CERT_FINGERPRINT" ] || continue
+        echo "External certificate changed, validating..."
+        if validate_tls_pair "$TLS_SOURCE_CERT" "$TLS_SOURCE_KEY" \
+           && install_external_tls_pair "$TLS_SOURCE_CERT" "$TLS_SOURCE_KEY"; then
+            if postfix reload; then
+                echo "Postfix reloaded with the renewed certificate"
+                TLS_CERT_FINGERPRINT="$current"
+            else
+                # Leave the fingerprint unchanged so the next tick retries.
+                echo "Warning: postfix reload failed, retrying on the next check"
+            fi
+        else
+            echo "Warning: new external certificate rejected, keeping the previous one"
+        fi
+      done
+    ) &
+    BG_PIDS+=("$!")
 fi
 
 # Signal handling: clean up background processes on shutdown
 cleanup() {
     echo "Shutting down..."
     kill "$OPENDKIM_PID" 2>/dev/null
-    [ -n "$RENEW_PID" ] && kill "$RENEW_PID" 2>/dev/null
+    for pid in "${BG_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null
+    done
     wait "$OPENDKIM_PID" 2>/dev/null
     exit 0
 }
