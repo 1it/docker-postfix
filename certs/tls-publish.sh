@@ -29,10 +29,21 @@ case "$TLS_GENERATIONS" in
 esac
 [ "$TLS_GENERATIONS" -ge 1 ] || TLS_GENERATIONS=1
 
+# Remove a temporary file or directory and report cleanup failures. Private
+# staging files use mode 0600 inside mode-0700 directories, so a cleanup failure
+# is not a silent leak, but it still needs to be visible to the operator.
+tls_remove_temp_path() {
+    if ! rm -rf -- "$1"; then
+        echo "Warning: unable to remove temporary TLS path $1" >&2
+        return 1
+    fi
+    return 0
+}
+
 # Print a short description of the certificate and fail when the pair cannot be
 # served. Called on the staged files, so what is validated is what is published.
 tls_validate_pair() {
-    local cert="$1" key="$2" cert_hash key_hash subject not_after chain_split count block
+    local cert="$1" key="$2" cert_pub key_pub subject not_after chain_split count block grep_status
 
     if ! openssl x509 -in "$cert" -noout >/dev/null 2>&1; then
         echo "  cannot parse the leaf certificate: $cert"
@@ -45,7 +56,17 @@ tls_validate_pair() {
 
     # Postfix loads at most one key per algorithm from smtpd_tls_chain_files, so
     # a bundle holding several keys is refused instead of silently mis-paired.
-    count=$(grep -c -E '^-----BEGIN ((RSA|EC|DSA|ENCRYPTED) )?PRIVATE KEY-----$' "$key" 2>/dev/null || true)
+    if count=$(grep -c -E '^-----BEGIN ((RSA|EC|DSA|ENCRYPTED) )?PRIVATE KEY-----$' "$key" 2>/dev/null); then
+        :
+    else
+        grep_status=$?
+        if [ "$grep_status" -eq 1 ]; then
+            count=0
+        else
+            echo "  could not inspect private key PEM markers: $key"
+            return 1
+        fi
+    fi
     if [ "${count:-0}" -lt 1 ]; then
         echo "  no PEM private key found in $key"
         return 1
@@ -65,7 +86,7 @@ tls_validate_pair() {
         n > 0 { print > file }
     ' "$cert" 2>/dev/null; then
         echo "  could not split the certificate chain: $cert"
-        rm -rf "$chain_split"
+        tls_remove_temp_path "$chain_split"
         return 1
     fi
     count=0
@@ -75,31 +96,48 @@ tls_validate_pair() {
     done
     if [ "${count:-0}" -lt 1 ]; then
         echo "  no PEM certificate found in $cert"
-        rm -rf "$chain_split"
+        tls_remove_temp_path "$chain_split"
         return 1
     fi
     for block in "$chain_split"/*.pem; do
         if ! openssl x509 -in "$block" -noout >/dev/null 2>&1; then
             echo "  malformed certificate in the chain: $block"
-            rm -rf "$chain_split"
+            tls_remove_temp_path "$chain_split"
             return 1
         fi
     done
     echo "  chain: ${count} certificate(s)"
-    rm -rf "$chain_split"
+    if ! tls_remove_temp_path "$chain_split"; then
+        echo "  cannot continue validation while temporary chain files remain"
+        return 1
+    fi
 
-    cert_hash=$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null | openssl sha256 2>/dev/null | awk '{print $NF}')
-    key_hash=$(openssl pkey -in "$key" -pubout 2>/dev/null | openssl sha256 2>/dev/null | awk '{print $NF}')
-    if [ -z "$cert_hash" ] || [ -z "$key_hash" ]; then
+    if ! cert_pub=$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null); then
+        echo "  cannot extract the public key from certificate: $cert"
+        return 1
+    fi
+    if ! key_pub=$(openssl pkey -in "$key" -pubout 2>/dev/null); then
+        echo "  cannot extract the public key from private key: $key"
+        return 1
+    fi
+    if [ -z "$cert_pub" ] || [ -z "$key_pub" ]; then
         echo "  cannot extract the public key from the staged pair"
         return 1
     fi
-    if [ "$cert_hash" != "$key_hash" ]; then
+    if [ "$cert_pub" != "$key_pub" ]; then
         echo "  certificate and private key do not belong to the same pair"
         return 1
     fi
-    subject=$(openssl x509 -in "$cert" -noout -subject | sed 's/^subject= *//')
-    not_after=$(openssl x509 -in "$cert" -noout -enddate | sed 's/^notAfter=//')
+    if ! subject=$(openssl x509 -in "$cert" -noout -subject); then
+        echo "  cannot read certificate subject: $cert"
+        return 1
+    fi
+    subject=${subject#subject=}
+    if ! not_after=$(openssl x509 -in "$cert" -noout -enddate); then
+        echo "  cannot read certificate expiry: $cert"
+        return 1
+    fi
+    not_after=${not_after#notAfter=}
     echo "  subject: ${subject:-unknown}"
     echo "  expires: ${not_after:-unknown}"
     if ! openssl x509 -in "$cert" -noout -checkend 604800 >/dev/null 2>&1; then
@@ -120,13 +158,24 @@ tls_pair_fingerprint() {
     [ -r "$cert" ] && [ -r "$key" ] || return 1
     mkdir -p "$TLS_STATE_DIR" || return 1
     temp=$(mktemp "${TLS_STATE_DIR}/.fingerprint.XXXXXX") || return 1
-    chmod 600 "$temp" || { rm -f "$temp"; return 1; }
-    if ! cat "$key" "$cert" > "$temp" 2>/dev/null; then
-        rm -f "$temp"
+    if ! chmod 600 "$temp"; then
+        echo "Warning: unable to secure fingerprint temporary file $temp" >&2
+        tls_remove_temp_path "$temp"
         return 1
     fi
-    output=$(sha256sum "$temp" 2>/dev/null) || { rm -f "$temp"; return 1; }
-    rm -f "$temp"
+    if ! cat "$key" "$cert" > "$temp" 2>/dev/null; then
+        echo "Warning: unable to read source pair while fingerprinting" >&2
+        tls_remove_temp_path "$temp"
+        return 1
+    fi
+    if ! output=$(sha256sum "$temp" 2>/dev/null); then
+        echo "Warning: unable to hash fingerprint temporary file $temp" >&2
+        tls_remove_temp_path "$temp"
+        return 1
+    fi
+    if ! tls_remove_temp_path "$temp"; then
+        return 1
+    fi
     printf '%s\n' "${output%% *}"
 }
 
@@ -142,14 +191,31 @@ tls_installed_fingerprint() {
 # so the pair being served is never collected from under Postfix.
 tls_prune_generations() {
     local live gen keep index
-    live=$(readlink "${TLS_STATE_DIR}/live" 2>/dev/null || true)
+    local -a generations=()
+    if ! live=$(readlink "${TLS_STATE_DIR}/live" 2>/dev/null); then
+        echo "Warning: unable to read ${TLS_STATE_DIR}/live; skipping generation pruning"
+        return 0
+    fi
+    case "$live" in
+        /*) ;;
+        *) live="${TLS_STATE_DIR}/${live}" ;;
+    esac
+    for gen in "${TLS_STATE_DIR}"/gen.*; do
+        if [ -d "$gen" ]; then
+            generations+=("$gen")
+        fi
+    done
     keep=$((TLS_GENERATIONS - 1))
-    index=0
-    for gen in $(ls -1d "${TLS_STATE_DIR}"/gen.* 2>/dev/null | sort -r); do
+    index=$((${#generations[@]} - 1))
+    while [ "$index" -ge 0 ]; do
+        gen=${generations[$index]}
+        index=$((index - 1))
         [ "$gen" = "$live" ] && continue
-        index=$((index + 1))
-        if [ "$index" -gt "$keep" ]; then
-            rm -rf "$gen"
+        keep=$((keep - 1))
+        if [ "$keep" -lt 0 ]; then
+            if ! rm -rf "$gen"; then
+                echo "Warning: unable to remove old TLS generation ${gen}"
+            fi
         fi
     done
     return 0
@@ -196,40 +262,48 @@ tls_publish_pair_locked() {
             cat "$key" > "$gen/privkey.pem" &&
             cat "$cert" > "$gen/fullchain.pem" ) 2>/dev/null; then
         echo "  could not read ${cert} / ${key}"
-        rm -rf "$gen"
+        tls_remove_temp_path "$gen"
         return 1
     fi
     # Validate the staged copies, not the source: a host renewal or a mounted
     # secret rotation between validation and copying must not decide what is
     # served.
     if ! tls_validate_pair "$gen/fullchain.pem" "$gen/privkey.pem"; then
-        rm -rf "$gen"
+        tls_remove_temp_path "$gen"
         return 1
     fi
     # Key first, then the chain, in the file Postfix reads.
     if ! ( umask 077; cat "$gen/privkey.pem" "$gen/fullchain.pem" > "$gen/tls.pem" ) 2>/dev/null; then
         echo "  could not assemble the combined PEM"
-        rm -rf "$gen"
+        tls_remove_temp_path "$gen"
         return 1
     fi
     if ! chown root:postfix "$gen/tls.pem" 2>/dev/null ||
        ! chmod 750 "$gen" || ! chmod 640 "$gen/tls.pem"; then
         echo "  could not secure the published certificate permissions"
-        rm -rf "$gen"
+        tls_remove_temp_path "$gen"
         return 1
     fi
-    rm -f "$gen/privkey.pem" "$gen/fullchain.pem"
+    if ! rm -f "$gen/privkey.pem" "$gen/fullchain.pem"; then
+        echo "  could not remove private staging files before activation"
+        tls_remove_temp_path "$gen"
+        return 1
+    fi
     # One rename publishes the pair: no Postfix process can read a new
     # certificate with an old key, and a failure here leaves the previous pair
     # in place.
     # Use a per-invocation symlink name so simultaneous publishers do not
     # replace or remove each other's staging links.
     live_tmp="${TLS_STATE_DIR}/live.new.$$.$RANDOM"
-    ln -s "$gen" "$live_tmp" || { rm -rf "$gen"; return 1; }
+    if ! ln -s "$gen" "$live_tmp"; then
+        echo "  could not create the activation symlink $live_tmp"
+        tls_remove_temp_path "$gen"
+        return 1
+    fi
     if ! mv -Tf "$live_tmp" "${TLS_STATE_DIR}/live" 2>/dev/null; then
         echo "  could not activate the new certificate"
-        rm -f "$live_tmp"
-        rm -rf "$gen"
+        tls_remove_temp_path "$live_tmp"
+        tls_remove_temp_path "$gen"
         return 1
     fi
     tls_prune_generations
@@ -242,7 +316,10 @@ tls_publish_pair_locked() {
 tls_publish_pair() {
     mkdir -p "$TLS_STATE_DIR" || return 1
     (
-        flock -x 9 || exit 1
+        if ! flock -x 9; then
+            echo "Error: could not acquire the TLS publication lock"
+            exit 1
+        fi
         tls_publish_pair_locked "$@"
     ) 9>"${TLS_STATE_DIR}/.publish.lock"
 }

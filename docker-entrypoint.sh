@@ -136,6 +136,7 @@ TLS_SOURCE_KEY=""       # private key the pair is published from
 TLS_WATCH=0             # watch the external pair for changes
 TLS_EXPLICIT=0          # TLS_CERT_FILE/TLS_KEY_FILE were supplied by the operator
 LE_RENEWAL_READY=0      # existing acme.sh hook was successfully registered
+TLS_SKIP_ISSUANCE=0      # a failed restore must fall back rather than re-issue
 
 # Print the acme.sh key-type option for a certificate managed in this
 # container. It stores RSA state under <config-home>/<domain>/ and EC state
@@ -150,19 +151,37 @@ acme_domain_variant() {
     local ecc_cert="${ecc_dir}/${LE_PRIMARY}.cer"
     local live_key rsa_key ecc_key live_cert rsa_cert_fp ecc_cert_fp
 
-    live_key=$(openssl pkey -in "$LE_KEY" -pubout 2>/dev/null) || return 1
-    live_cert=$(openssl x509 -in "$LE_CERT" -noout -fingerprint -sha256 2>/dev/null) || return 1
+    if ! live_key=$(openssl pkey -in "$LE_KEY" -pubout 2>/dev/null); then
+        echo "Warning: unable to inspect the active Let's Encrypt private key for acme.sh state matching" >&2
+        return 1
+    fi
+    if ! live_cert=$(openssl x509 -in "$LE_CERT" -noout -fingerprint -sha256 2>/dev/null); then
+        echo "Warning: unable to inspect the active Let's Encrypt certificate for acme.sh state matching" >&2
+        return 1
+    fi
     rsa_key=""
     ecc_key=""
     rsa_cert_fp=""
     ecc_cert_fp=""
     if [ -f "$rsa_cert" ]; then
-        rsa_key=$(openssl pkey -in "${rsa_dir}/${LE_PRIMARY}.key" -pubout 2>/dev/null) || rsa_key=""
-        rsa_cert_fp=$(openssl x509 -in "$rsa_cert" -noout -fingerprint -sha256 2>/dev/null) || rsa_cert_fp=""
+        if ! rsa_key=$(openssl pkey -in "${rsa_dir}/${LE_PRIMARY}.key" -pubout 2>/dev/null); then
+            echo "Warning: unable to inspect the RSA acme.sh key in ${rsa_dir}" >&2
+            rsa_key=""
+        fi
+        if ! rsa_cert_fp=$(openssl x509 -in "$rsa_cert" -noout -fingerprint -sha256 2>/dev/null); then
+            echo "Warning: unable to inspect the RSA acme.sh certificate at ${rsa_cert}" >&2
+            rsa_cert_fp=""
+        fi
     fi
     if [ -f "$ecc_cert" ]; then
-        ecc_key=$(openssl pkey -in "${ecc_dir}/${LE_PRIMARY}.key" -pubout 2>/dev/null) || ecc_key=""
-        ecc_cert_fp=$(openssl x509 -in "$ecc_cert" -noout -fingerprint -sha256 2>/dev/null) || ecc_cert_fp=""
+        if ! ecc_key=$(openssl pkey -in "${ecc_dir}/${LE_PRIMARY}.key" -pubout 2>/dev/null); then
+            echo "Warning: unable to inspect the EC acme.sh key in ${ecc_dir}" >&2
+            ecc_key=""
+        fi
+        if ! ecc_cert_fp=$(openssl x509 -in "$ecc_cert" -noout -fingerprint -sha256 2>/dev/null); then
+            echo "Warning: unable to inspect the EC acme.sh certificate at ${ecc_cert}" >&2
+            ecc_cert_fp=""
+        fi
     fi
     if [ -n "$rsa_key" ] && [ "$live_key" = "$rsa_key" ] && [ "$live_cert" = "$rsa_cert_fp" ] &&
        { [ "$live_key" != "$ecc_key" ] || [ "$live_cert" != "$ecc_cert_fp" ]; }; then
@@ -245,16 +264,38 @@ if [ -z "$TLS_MODE" ] && [ "$TLS_EXPLICIT" = "0" ] && [ -n "$LE_PRIMARY" ] && [ 
             if ! tls_validate_pair "$LE_CERT" "$LE_KEY" >/dev/null 2>&1; then
                 echo "Warning: re-registering damaged ${LE_DIR}, restoring the previous files"
                 if [ "$TLS_BACKUP_READY" = "1" ]; then
-                    cat "${tls_backup_dir}/fullchain.pem" > "$LE_CERT" 2>/dev/null || true
-                    cat "${tls_backup_dir}/privkey.pem" > "$LE_KEY" 2>/dev/null || true
+                    TLS_RESTORE_FAILED=0
+                    if ! cat "${tls_backup_dir}/fullchain.pem" > "$LE_CERT" 2>/dev/null; then
+                        echo "Error: failed to restore the previous certificate to ${LE_CERT}"
+                        TLS_RESTORE_FAILED=1
+                    fi
+                    if ! cat "${tls_backup_dir}/privkey.pem" > "$LE_KEY" 2>/dev/null; then
+                        echo "Error: failed to restore the previous private key to ${LE_KEY}"
+                        TLS_RESTORE_FAILED=1
+                    fi
+                    if [ "$TLS_RESTORE_FAILED" = "0" ] &&
+                       ! tls_validate_pair "$LE_CERT" "$LE_KEY" >/dev/null 2>&1; then
+                        echo "Error: restored certificate pair is still invalid"
+                        TLS_RESTORE_FAILED=1
+                    fi
+                else
+                    echo "Error: no backup is available to restore the previous certificate pair"
+                    TLS_RESTORE_FAILED=1
                 fi
                 LE_RENEWAL_READY=0
             fi
         fi
-        [ -z "$tls_backup_dir" ] || rm -rf "$tls_backup_dir"
+        if [ -n "$tls_backup_dir" ] && ! rm -rf "$tls_backup_dir"; then
+            echo "Warning: could not remove private certificate backup directory ${tls_backup_dir}"
+        fi
         TLS_MODE=letsencrypt
         TLS_SOURCE_CERT="$LE_CERT"
         TLS_SOURCE_KEY="$LE_KEY"
+        if [ "${TLS_RESTORE_FAILED:-0}" = "1" ]; then
+            echo "Warning: previous certificate restoration failed; falling back to self-signed TLS"
+            TLS_MODE=""
+            TLS_SKIP_ISSUANCE=1
+        fi
     else
         # No matching acme.sh state for this active pair: it was placed or
         # renewed outside the container, so treat it as externally managed.
@@ -276,7 +317,7 @@ fi
 # --- 3. Issue with Let's Encrypt (acme.sh, HTTP-01 standalone) --------------
 # Skipped when explicit certificate paths were given: those override issuance
 # whether or not the pair turned out to be usable.
-if [ -z "$TLS_MODE" ] && [ "$TLS_EXPLICIT" = "0" ] && [ -n "$LETSENCRYPT_EMAIL" ] && [ -n "$LE_PRIMARY" ]; then
+if [ -z "$TLS_MODE" ] && [ "$TLS_EXPLICIT" = "0" ] && [ "$TLS_SKIP_ISSUANCE" = "0" ] && [ -n "$LETSENCRYPT_EMAIL" ] && [ -n "$LE_PRIMARY" ]; then
     mkdir -p "$LE_DIR" "$ACME_CONFIG"
 
     # Build acme.sh domain arguments. Skip DOMAIN unless it is MAILNAME
@@ -564,22 +605,38 @@ if [ "$TLS_WATCH" = "1" ]; then
       # Baseline is the pair Postfix actually serves, not the source: a renewal
       # that lands between publishing and this line would otherwise be recorded
       # as already applied while the previous pair is still live.
-      TLS_CERT_FINGERPRINT=$(tls_installed_fingerprint) || TLS_CERT_FINGERPRINT=""
+      if ! TLS_CERT_FINGERPRINT=$(tls_installed_fingerprint); then
+        echo "Warning: unable to fingerprint the installed TLS pair; will check the source at the next interval"
+        TLS_CERT_FINGERPRINT=""
+      fi
       while true; do
         sleep "$TLS_WATCH_INTERVAL"
-        current=$(tls_pair_fingerprint "$TLS_SOURCE_CERT" "$TLS_SOURCE_KEY") || current=""
-        # Empty fingerprint: files are mid-rotation or gone, retry next tick.
-        [ -n "$current" ] || continue
-        [ "$current" != "$TLS_CERT_FINGERPRINT" ] || continue
+        if ! current=$(tls_pair_fingerprint "$TLS_SOURCE_CERT" "$TLS_SOURCE_KEY"); then
+            echo "Warning: unable to fingerprint external certificate files; retrying at the next interval"
+            continue
+        fi
+        if [ -z "$current" ]; then
+            echo "Warning: external certificate fingerprint was empty; retrying at the next interval"
+            continue
+        fi
+        if [ "$current" = "$TLS_CERT_FINGERPRINT" ]; then
+            continue
+        fi
         echo "External certificate changed, validating..."
         if tls_publish_pair "$TLS_SOURCE_CERT" "$TLS_SOURCE_KEY"; then
-            tls_apply_postfix_conf
+            if ! tls_apply_postfix_conf; then
+                echo "Error: could not configure Postfix to use the published certificate; retrying at the next interval"
+                continue
+            fi
             if postfix reload; then
                 echo "Postfix reloaded with the renewed certificate"
                 # Fingerprint what is now live. If the source changed again while
                 # it was being copied, this differs from $current and the next
                 # tick publishes the newer pair.
-                TLS_CERT_FINGERPRINT=$(tls_installed_fingerprint) || TLS_CERT_FINGERPRINT=""
+                if ! TLS_CERT_FINGERPRINT=$(tls_installed_fingerprint); then
+                    echo "Warning: unable to fingerprint the newly installed TLS pair; it may be republished at the next interval"
+                    TLS_CERT_FINGERPRINT=""
+                fi
             else
                 # Leave the fingerprint unchanged so the next tick retries.
                 echo "Warning: postfix reload failed, retrying on the next check"
