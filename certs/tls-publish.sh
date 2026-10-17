@@ -99,16 +99,21 @@ tls_validate_pair() {
 
 # Fingerprint of a certificate and key pair, empty when a file is missing or
 # unreadable. Content-based, so a renewal that preserves mtime is detected.
+#
+# This hashes exactly the byte stream tls_publish_pair assembles into the
+# published PEM: the key followed by the certificate chain. It has to, or the
+# result could never be compared with tls_installed_fingerprint and the watcher
+# would republish an unchanged certificate on every tick.
 tls_pair_fingerprint() {
     local cert="$1" key="$2"
     [ -r "$cert" ] && [ -r "$key" ] || return 1
-    md5sum "$cert" "$key" 2>/dev/null | awk '{print $1}' | tr -d '\n'
+    cat "$key" "$cert" 2>/dev/null | md5sum 2>/dev/null | awk '{print $1}'
 }
 
 # Fingerprint of the pair Postfix currently serves.
 tls_installed_fingerprint() {
     [ -r "$TLS_CHAIN_FILE" ] || return 1
-    md5sum "$TLS_CHAIN_FILE" 2>/dev/null | awk '{print $1}' | tr -d '\n'
+    md5sum "$TLS_CHAIN_FILE" 2>/dev/null | awk '{print $1}'
 }
 
 # Keep the newest generations and whatever "live" points at, so the pair being
@@ -198,6 +203,17 @@ tls_publish_pair() {
     fi
     tls_prune_generations
     return 0
+}
+
+# Re-point Postfix at the self-signed certificates. Needed on the fallback path:
+# tls_apply_postfix_conf clears smtpd_tls_cert_file and smtpd_tls_key_file and
+# sets smtpd_tls_chain_files, and main.cf lives in the container layer, so
+# without this a later fallback would generate self-signed files that Postfix
+# never selects and keep serving the previously published pair.
+tls_apply_self_signed_conf() {
+    postconf -e "smtpd_tls_chain_files ="
+    postconf -e "smtpd_tls_cert_file = /etc/ssl/postfix/certs/postfix.crt"
+    postconf -e "smtpd_tls_key_file = /etc/ssl/postfix/private/postfix.key"
 }
 
 # Reload Postfix, but only when it is running: acme.sh runs this through

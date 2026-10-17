@@ -170,13 +170,53 @@ if [ -n "$TLS_CERT_FILE" ] || [ -n "$TLS_KEY_FILE" ]; then
 fi
 
 # --- 2. Certificates already present in the standard acme.sh layout ---------
-if [ -z "$TLS_MODE" ] && [ -n "$LE_PRIMARY" ] && [ -e "$LE_CERT" ] && [ -e "$LE_KEY" ]; then
+# Skipped when explicit certificate paths were given: those select the
+# certificate, so a stale file under /etc/letsencrypt must not quietly become
+# the pair in service, whether it is acme.sh-managed or externally supplied.
+if [ -z "$TLS_MODE" ] && [ "$TLS_EXPLICIT" = "0" ] && [ -n "$LE_PRIMARY" ] && [ -e "$LE_CERT" ] && [ -e "$LE_KEY" ]; then
     if acme_manages_domain; then
-        # Issued by this container earlier; keep the acme.sh renewal path.
+        # Issued by this container earlier; keep the acme.sh renewal path and
+        # re-register the install paths and the publisher as its renewal
+        # command. Volumes created by an earlier image still have "postfix
+        # reload" stored, and since this branch does not issue, nothing would
+        # ever replace it: a renewal would update these source files while
+        # Postfix kept reading the combined PEM, which then expires. Both the
+        # RSA and EC state layouts are registered.
+        echo "Using existing Let's Encrypt certificates for ${LE_PRIMARY}"
+        TLS_ECC_OPT=""
+        if [ ! -d "${ACME_CONFIG}/${LE_PRIMARY}" ] && [ -d "${ACME_CONFIG}/${LE_PRIMARY}_ecc" ]; then
+            TLS_ECC_OPT="--ecc"
+        fi
+        # --install-cert rewrites the target files from acme.sh's own state, so
+        # an incomplete or unreadable state directory can truncate a working
+        # certificate to zero bytes. Keep a copy and restore it if the
+        # registration does not leave a usable pair behind.
+        tls_backup_dir=$(mktemp -d)
+        cat "$LE_CERT" > "${tls_backup_dir}/fullchain.pem" 2>/dev/null
+        cat "$LE_KEY" > "${tls_backup_dir}/privkey.pem" 2>/dev/null
+        # shellcheck disable=SC2086 # TLS_ECC_OPT is intentionally empty or --ecc
+        if "$ACME_SH" --install-cert -d "$LE_PRIMARY" $TLS_ECC_OPT \
+                --config-home "$ACME_CONFIG" \
+                --key-file "$LE_KEY" \
+                --fullchain-file "$LE_CERT" \
+                --reloadcmd "/usr/local/bin/tls-publish.sh $LE_CERT $LE_KEY" >/dev/null 2>&1; then
+            echo "Registered the renewal command for ${LE_PRIMARY}"
+        else
+            # Not fatal on its own: the certificate in use is unaffected, only
+            # renewal automation. But say so explicitly, since it means the loop
+            # below cannot publish renewed pairs.
+            echo "Warning: could not register the renewal command for ${LE_PRIMARY}, renewals may not be applied"
+        fi
+        # Whatever happened above, never continue with a pair acme.sh damaged.
+        if ! openssl x509 -in "$LE_CERT" -noout >/dev/null 2>&1 || ! openssl pkey -in "$LE_KEY" -noout >/dev/null 2>&1; then
+            echo "Warning: re-registering damaged ${LE_DIR}, restoring the previous files"
+            cat "${tls_backup_dir}/fullchain.pem" > "$LE_CERT" 2>/dev/null
+            cat "${tls_backup_dir}/privkey.pem" > "$LE_KEY" 2>/dev/null
+        fi
+        rm -rf "$tls_backup_dir"
         TLS_MODE=letsencrypt
         TLS_SOURCE_CERT="$LE_CERT"
         TLS_SOURCE_KEY="$LE_KEY"
-        echo "Using existing Let's Encrypt certificates for ${LE_PRIMARY}"
     else
         # No acme.sh state for this name: the files were placed there by
         # something outside the container, so treat them as externally renewed.
@@ -239,13 +279,20 @@ if [ -z "$TLS_MODE" ] && [ "$TLS_EXPLICIT" = "0" ] && [ -n "$LETSENCRYPT_EMAIL" 
 fi
 
 # --- Apply the published certificate to Postfix -----------------------------
-if [ -n "$TLS_MODE" ] && [ ! -r "$TLS_CHAIN_FILE" ]; then
-    # Nothing published yet: the acme.sh --reloadcmd runs on renewal, not on
-    # startup, and an externally supplied pair is published in step 1 or 2.
+if [ -n "$TLS_MODE" ] && [ "$TLS_MODE" = "letsencrypt" ]; then
+    # Always publish an acme.sh-managed pair, even when a combined PEM already
+    # exists on the persistent postfix_certs volume: it may belong to a previous
+    # source, another MAILNAME, or an older version of this certificate, and
+    # Postfix would serve it until some later renewal replaced it. External
+    # pairs are already published in step 1 or 2.
     if ! tls_publish_pair "$TLS_SOURCE_CERT" "$TLS_SOURCE_KEY"; then
         echo "Warning: could not publish the certificate, falling back to self-signed certificates"
         TLS_MODE=""
-        LETSENCRYPT_EMAIL=""
+    fi
+elif [ -n "$TLS_MODE" ] && [ ! -r "$TLS_CHAIN_FILE" ]; then
+    if ! tls_publish_pair "$TLS_SOURCE_CERT" "$TLS_SOURCE_KEY"; then
+        echo "Warning: could not publish the certificate, falling back to self-signed certificates"
+        TLS_MODE=""
     fi
 fi
 
@@ -270,6 +317,10 @@ if [ -z "$TLS_MODE" ]; then
         echo "Generating self-signed TLS certificates..."
         /usr/local/bin/certgen.sh
     fi
+    # Point Postfix back at them. An earlier run on the same container may have
+    # set smtpd_tls_chain_files, which Postfix prefers over these parameters, so
+    # generating the files is not enough on its own.
+    tls_apply_self_signed_conf
 fi
 
 update-ca-certificates
