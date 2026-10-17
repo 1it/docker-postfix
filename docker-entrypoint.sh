@@ -135,14 +135,45 @@ TLS_SOURCE_CERT=""      # certificate the pair is published from
 TLS_SOURCE_KEY=""       # private key the pair is published from
 TLS_WATCH=0             # watch the external pair for changes
 TLS_EXPLICIT=0          # TLS_CERT_FILE/TLS_KEY_FILE were supplied by the operator
+LE_RENEWAL_READY=0      # existing acme.sh hook was successfully registered
 
-# True when this container's own acme.sh issued the certificate for LE_PRIMARY
-# and can therefore renew it. acme.sh keeps per-domain state under
-# <config-home>/<domain>/ for RSA keys and <config-home>/<domain>_ecc/ for EC
-# ones, and ec-256 is its default, so both layouts have to be recognized.
-acme_manages_domain() {
-    [ -f "${ACME_CONFIG}/${LE_PRIMARY}/${LE_PRIMARY}.cer" ] ||
-        [ -f "${ACME_CONFIG}/${LE_PRIMARY}_ecc/${LE_PRIMARY}.cer" ]
+# Print the acme.sh key-type option for a certificate managed in this
+# container. It stores RSA state under <config-home>/<domain>/ and EC state
+# under <config-home>/<domain>_ecc/ (ec-256 is the default). Select a state
+# directory only if its certificate and private key match the currently
+# installed pair; otherwise stale local state could overwrite a certificate
+# renewed elsewhere (including a renewal that reused the same private key).
+acme_domain_variant() {
+    local rsa_dir="${ACME_CONFIG}/${LE_PRIMARY}"
+    local ecc_dir="${ACME_CONFIG}/${LE_PRIMARY}_ecc"
+    local rsa_cert="${rsa_dir}/${LE_PRIMARY}.cer"
+    local ecc_cert="${ecc_dir}/${LE_PRIMARY}.cer"
+    local live_key rsa_key ecc_key live_cert rsa_cert_fp ecc_cert_fp
+
+    live_key=$(openssl pkey -in "$LE_KEY" -pubout 2>/dev/null) || return 1
+    live_cert=$(openssl x509 -in "$LE_CERT" -noout -fingerprint -sha256 2>/dev/null) || return 1
+    rsa_key=""
+    ecc_key=""
+    rsa_cert_fp=""
+    ecc_cert_fp=""
+    if [ -f "$rsa_cert" ]; then
+        rsa_key=$(openssl pkey -in "${rsa_dir}/${LE_PRIMARY}.key" -pubout 2>/dev/null) || rsa_key=""
+        rsa_cert_fp=$(openssl x509 -in "$rsa_cert" -noout -fingerprint -sha256 2>/dev/null) || rsa_cert_fp=""
+    fi
+    if [ -f "$ecc_cert" ]; then
+        ecc_key=$(openssl pkey -in "${ecc_dir}/${LE_PRIMARY}.key" -pubout 2>/dev/null) || ecc_key=""
+        ecc_cert_fp=$(openssl x509 -in "$ecc_cert" -noout -fingerprint -sha256 2>/dev/null) || ecc_cert_fp=""
+    fi
+    if [ -n "$rsa_key" ] && [ "$live_key" = "$rsa_key" ] && [ "$live_cert" = "$rsa_cert_fp" ] &&
+       { [ "$live_key" != "$ecc_key" ] || [ "$live_cert" != "$ecc_cert_fp" ]; }; then
+        return 0
+    fi
+    if [ -n "$ecc_key" ] && [ "$live_key" = "$ecc_key" ] && [ "$live_cert" = "$ecc_cert_fp" ] &&
+       { [ "$live_key" != "$rsa_key" ] || [ "$live_cert" != "$rsa_cert_fp" ]; }; then
+        echo "--ecc"
+        return 0
+    fi
+    return 1
 }
 
 # --- 1. Explicit external certificate paths ---------------------------------
@@ -174,7 +205,7 @@ fi
 # certificate, so a stale file under /etc/letsencrypt must not quietly become
 # the pair in service, whether it is acme.sh-managed or externally supplied.
 if [ -z "$TLS_MODE" ] && [ "$TLS_EXPLICIT" = "0" ] && [ -n "$LE_PRIMARY" ] && [ -e "$LE_CERT" ] && [ -e "$LE_KEY" ]; then
-    if acme_manages_domain; then
+    if TLS_ECC_OPT=$(acme_domain_variant); then
         # Issued by this container earlier; keep the acme.sh renewal path and
         # re-register the install paths and the publisher as its renewal
         # command. Volumes created by an earlier image still have "postfix
@@ -183,44 +214,51 @@ if [ -z "$TLS_MODE" ] && [ "$TLS_EXPLICIT" = "0" ] && [ -n "$LE_PRIMARY" ] && [ 
         # Postfix kept reading the combined PEM, which then expires. Both the
         # RSA and EC state layouts are registered.
         echo "Using existing Let's Encrypt certificates for ${LE_PRIMARY}"
-        TLS_ECC_OPT=""
-        if [ ! -d "${ACME_CONFIG}/${LE_PRIMARY}" ] && [ -d "${ACME_CONFIG}/${LE_PRIMARY}_ecc" ]; then
-            TLS_ECC_OPT="--ecc"
-        fi
         # --install-cert rewrites the target files from acme.sh's own state, so
         # an incomplete or unreadable state directory can truncate a working
-        # certificate to zero bytes. Keep a copy and restore it if the
-        # registration does not leave a usable pair behind.
-        tls_backup_dir=$(mktemp -d)
-        cat "$LE_CERT" > "${tls_backup_dir}/fullchain.pem" 2>/dev/null
-        cat "$LE_KEY" > "${tls_backup_dir}/privkey.pem" 2>/dev/null
-        # shellcheck disable=SC2086 # TLS_ECC_OPT is intentionally empty or --ecc
-        if "$ACME_SH" --install-cert -d "$LE_PRIMARY" $TLS_ECC_OPT \
-                --config-home "$ACME_CONFIG" \
-                --key-file "$LE_KEY" \
-                --fullchain-file "$LE_CERT" \
-                --reloadcmd "/usr/local/bin/tls-publish.sh $LE_CERT $LE_KEY" >/dev/null 2>&1; then
-            echo "Registered the renewal command for ${LE_PRIMARY}"
+        # certificate to zero bytes. Keep a private copy and restore it if
+        # registration fails or leaves a malformed/mismatched pair behind.
+        tls_backup_dir=$(mktemp -d) || tls_backup_dir=""
+        TLS_BACKUP_READY=0
+        if [ -n "$tls_backup_dir" ] &&
+           ( umask 077; cat "$LE_CERT" > "${tls_backup_dir}/fullchain.pem" && cat "$LE_KEY" > "${tls_backup_dir}/privkey.pem" ) 2>/dev/null; then
+            TLS_BACKUP_READY=1
         else
-            # Not fatal on its own: the certificate in use is unaffected, only
-            # renewal automation. But say so explicitly, since it means the loop
-            # below cannot publish renewed pairs.
-            echo "Warning: could not register the renewal command for ${LE_PRIMARY}, renewals may not be applied"
+            echo "Warning: could not back up the existing certificate pair; skipping acme.sh re-registration"
         fi
-        # Whatever happened above, never continue with a pair acme.sh damaged.
-        if ! openssl x509 -in "$LE_CERT" -noout >/dev/null 2>&1 || ! openssl pkey -in "$LE_KEY" -noout >/dev/null 2>&1; then
-            echo "Warning: re-registering damaged ${LE_DIR}, restoring the previous files"
-            cat "${tls_backup_dir}/fullchain.pem" > "$LE_CERT" 2>/dev/null
-            cat "${tls_backup_dir}/privkey.pem" > "$LE_KEY" 2>/dev/null
+        if [ "$TLS_BACKUP_READY" = "1" ]; then
+            # shellcheck disable=SC2086 # TLS_ECC_OPT is intentionally empty or --ecc
+            if "$ACME_SH" --install-cert -d "$LE_PRIMARY" $TLS_ECC_OPT \
+                    --config-home "$ACME_CONFIG" \
+                    --key-file "$LE_KEY" \
+                    --fullchain-file "$LE_CERT" \
+                    --reloadcmd "/usr/local/bin/tls-publish.sh $LE_CERT $LE_KEY" >/dev/null 2>&1; then
+                echo "Registered the renewal command for ${LE_PRIMARY}"
+                LE_RENEWAL_READY=1
+            else
+                # A failed hook must not be left in the renewal loop: it could
+                # renew the source files without ever publishing Postfix's PEM.
+                echo "Warning: could not register the renewal command for ${LE_PRIMARY}; automatic renewal is disabled"
+            fi
+            # Whatever happened above, never continue with a pair acme.sh
+            # damaged, even if both resulting files happen to parse separately.
+            if ! tls_validate_pair "$LE_CERT" "$LE_KEY" >/dev/null 2>&1; then
+                echo "Warning: re-registering damaged ${LE_DIR}, restoring the previous files"
+                if [ "$TLS_BACKUP_READY" = "1" ]; then
+                    cat "${tls_backup_dir}/fullchain.pem" > "$LE_CERT" 2>/dev/null || true
+                    cat "${tls_backup_dir}/privkey.pem" > "$LE_KEY" 2>/dev/null || true
+                fi
+                LE_RENEWAL_READY=0
+            fi
         fi
-        rm -rf "$tls_backup_dir"
+        [ -z "$tls_backup_dir" ] || rm -rf "$tls_backup_dir"
         TLS_MODE=letsencrypt
         TLS_SOURCE_CERT="$LE_CERT"
         TLS_SOURCE_KEY="$LE_KEY"
     else
-        # No acme.sh state for this name: the files were placed there by
-        # something outside the container, so treat them as externally renewed.
-        echo "Found certificates at ${LE_DIR} without local acme.sh state"
+        # No matching acme.sh state for this active pair: it was placed or
+        # renewed outside the container, so treat it as externally managed.
+        echo "Found certificates at ${LE_DIR} without matching local acme.sh state"
         if tls_publish_pair "$LE_CERT" "$LE_KEY"; then
             TLS_MODE=external
             TLS_SOURCE_CERT="$LE_CERT"
@@ -254,6 +292,10 @@ if [ -z "$TLS_MODE" ] && [ "$TLS_EXPLICIT" = "0" ] && [ -n "$LETSENCRYPT_EMAIL" 
     fi
     echo "Requesting Let's Encrypt certificate via HTTP-01 for: ${ACME_DOMAINS}"
     echo "Each name must resolve to this host on port 80 and must not be proxied by a CDN."
+    # Pin the key type so --install-cert selects the same state directory even
+    # when an older RSA state directory for this hostname also exists. acme.sh
+    # defaults to ec-256, but its install command otherwise prefers an RSA
+    # directory when both RSA and ECC state are present.
     # acme.sh runs --reloadcmd after installing and fails the install when it
     # exits non-zero, so the command publishes the renewed pair instead of a
     # bare "postfix reload": it must also succeed during startup, before the
@@ -262,8 +304,10 @@ if [ -z "$TLS_MODE" ] && [ "$TLS_EXPLICIT" = "0" ] && [ -n "$LETSENCRYPT_EMAIL" 
             --config-home "$ACME_CONFIG" \
             --server letsencrypt \
             --accountemail "$LETSENCRYPT_EMAIL" \
+            --keylength ec-256 \
             $ACME_DOMAINS && \
        "$ACME_SH" --install-cert -d "$LE_PRIMARY" \
+            --ecc \
             --config-home "$ACME_CONFIG" \
             --key-file "$LE_KEY" \
             --fullchain-file "$LE_CERT" \
@@ -272,6 +316,7 @@ if [ -z "$TLS_MODE" ] && [ "$TLS_EXPLICIT" = "0" ] && [ -n "$LETSENCRYPT_EMAIL" 
         TLS_MODE=letsencrypt
         TLS_SOURCE_CERT="$LE_CERT"
         TLS_SOURCE_KEY="$LE_KEY"
+        LE_RENEWAL_READY=1
     else
         echo "Warning: Let's Encrypt failed, falling back to self-signed certificates"
         LETSENCRYPT_EMAIL=""
@@ -499,7 +544,7 @@ BG_PIDS=()
 
 # Let's Encrypt auto-renewal: acme.sh --cron renews certs nearing expiry
 # and runs the stored --reloadcmd (tls-publish.sh) on success.
-if [ "$TLS_MODE" = "letsencrypt" ] && [ -n "$LE_PRIMARY" ] && [ -f "$LE_CERT" ]; then
+if [ "$TLS_MODE" = "letsencrypt" ] && [ "$LE_RENEWAL_READY" = "1" ] && [ -n "$LE_PRIMARY" ] && [ -f "$LE_CERT" ]; then
     echo "Starting Let's Encrypt renewal loop..."
     ( while true; do
         sleep 12h

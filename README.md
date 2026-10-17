@@ -128,7 +128,7 @@ start, so change `.env` and recreate the container to rotate credentials.
 |----------|---------|-------------|
 | `LETSENCRYPT_EMAIL` | — | Enables Let's Encrypt; email for account registration |
 | `LETSENCRYPT_EXTRA_DOMAINS` | — | Comma-separated extra domains for the certificate (SANs) |
-| `TLS_CERT_FILE` | — | Path to an existing certificate (full chain) inside the container; disables Let's Encrypt issuance |
+| `TLS_CERT_FILE` | — | Path to an existing certificate (full chain) inside the container; with `TLS_KEY_FILE`, overrides certificate detection and issuance |
 | `TLS_KEY_FILE` | — | Path to the matching private key; must be set together with `TLS_CERT_FILE` |
 | `TLS_WATCH_INTERVAL` | `300` | Seconds between checks for changes to `TLS_CERT_FILE`/`TLS_KEY_FILE`; `0` checks only at startup |
 | `SSL_COUNTRY` | `US` | Self-signed certificate country |
@@ -227,7 +227,7 @@ How they are used:
 - **Validated as a chain** — every certificate in the supplied bundle is parsed, not just the first, because a valid leaf followed by a malformed intermediate passes a first-certificate-only check and then fails TLS setup. The private key must hold exactly one key, matching the leaf.
 - **Watched for renewal** — every `TLS_WATCH_INTERVAL` seconds the source files are compared by content. On a change the new pair is staged, validated, published, and Postfix is reloaded, so a host-side renewal takes effect without restarting the container. The comparison starts from the pair that was published, so a renewal that lands during startup is not missed, and hashes the same bytes as the published file, so an unchanged certificate is left alone. A source that is unreadable, unparsable, or a mismatched pair is ignored and retried on the next tick, leaving the last good certificate in service.
 
-Certificates already sitting in the standard layout `/etc/letsencrypt/live/<MAILNAME>/` are picked up without any variables: mount them there and they are used as external certificates. If the container's own acme.sh state for that name is present (it issued the certificate itself), the built-in renewal loop keeps managing it instead, and the renewal command is re-registered on every start so a volume carried over from an earlier image still republishes renewed certificates.
+Certificates already sitting in the standard layout `/etc/letsencrypt/live/<MAILNAME>/` are picked up without any variables: mount them there and they are used as external certificates. If the container's own acme.sh state for that name matches the active certificate and key, the built-in renewal loop keeps managing it instead, and the renewal command is re-registered on every start so a volume carried over from an earlier image still republishes renewed certificates. Stale acme.sh state that does not match the active pair is not allowed to replace it. If re-registering the renewal hook fails, startup continues with the current valid certificate but logs a warning and disables the automatic renewal loop.
 
 If the configured files are missing, unreadable, or not a valid pair, the container logs a warning and falls back to self-signed certificates, as it does when Let's Encrypt fails. Setting these variables is a complete override: an unusable pair does not make the container reach for a certificate found elsewhere, or attempt issuance, since either would silently serve something other than what was asked for.
 

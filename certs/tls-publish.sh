@@ -24,6 +24,10 @@ TLS_STATE_DIR=${TLS_STATE_DIR:-/etc/ssl/postfix/tls}
 TLS_CHAIN_FILE="${TLS_STATE_DIR}/live/tls.pem"
 # Number of published pairs to keep, including the live one.
 TLS_GENERATIONS=${TLS_GENERATIONS:-2}
+case "$TLS_GENERATIONS" in
+    ''|*[!0-9]*) TLS_GENERATIONS=2 ;;
+esac
+[ "$TLS_GENERATIONS" -ge 1 ] || TLS_GENERATIONS=1
 
 # Print a short description of the certificate and fail when the pair cannot be
 # served. Called on the staged files, so what is validated is what is published.
@@ -54,14 +58,21 @@ tls_validate_pair() {
     # openssl x509 only reads the first certificate of a bundle, so every
     # certificate in the chain is checked separately: a valid leaf followed by
     # a malformed intermediate would otherwise pass and break TLS setup.
-    chain_split="${TLS_STATE_DIR}/.chain-check"
-    rm -rf "$chain_split"
-    mkdir -p "$chain_split" || return 1
-    awk -v dir="$chain_split" '
+    mkdir -p "$TLS_STATE_DIR" || return 1
+    chain_split=$(mktemp -d "${TLS_STATE_DIR}/.chain-check.XXXXXX") || return 1
+    if ! awk -v dir="$chain_split" '
         /-----BEGIN CERTIFICATE-----/ { n++; file = sprintf("%s/%04d.pem", dir, n) }
         n > 0 { print > file }
-    ' "$cert" 2>/dev/null
-    count=$(ls -1 "$chain_split" 2>/dev/null | wc -l)
+    ' "$cert" 2>/dev/null; then
+        echo "  could not split the certificate chain: $cert"
+        rm -rf "$chain_split"
+        return 1
+    fi
+    count=0
+    for block in "$chain_split"/*.pem; do
+        [ -f "$block" ] || continue
+        count=$((count + 1))
+    done
     if [ "${count:-0}" -lt 1 ]; then
         echo "  no PEM certificate found in $cert"
         rm -rf "$chain_split"
@@ -105,25 +116,39 @@ tls_validate_pair() {
 # result could never be compared with tls_installed_fingerprint and the watcher
 # would republish an unchanged certificate on every tick.
 tls_pair_fingerprint() {
-    local cert="$1" key="$2"
+    local cert="$1" key="$2" temp output
     [ -r "$cert" ] && [ -r "$key" ] || return 1
-    cat "$key" "$cert" 2>/dev/null | md5sum 2>/dev/null | awk '{print $1}'
+    mkdir -p "$TLS_STATE_DIR" || return 1
+    temp=$(mktemp "${TLS_STATE_DIR}/.fingerprint.XXXXXX") || return 1
+    chmod 600 "$temp" || { rm -f "$temp"; return 1; }
+    if ! cat "$key" "$cert" > "$temp" 2>/dev/null; then
+        rm -f "$temp"
+        return 1
+    fi
+    output=$(sha256sum "$temp" 2>/dev/null) || { rm -f "$temp"; return 1; }
+    rm -f "$temp"
+    printf '%s\n' "${output%% *}"
 }
 
 # Fingerprint of the pair Postfix currently serves.
 tls_installed_fingerprint() {
+    local output
     [ -r "$TLS_CHAIN_FILE" ] || return 1
-    md5sum "$TLS_CHAIN_FILE" 2>/dev/null | awk '{print $1}'
+    output=$(sha256sum "$TLS_CHAIN_FILE" 2>/dev/null) || return 1
+    printf '%s\n' "${output%% *}"
 }
 
-# Keep the newest generations and whatever "live" points at, so the pair being
-# served is never collected from under Postfix.
+# Keep the live pair and at most TLS_GENERATIONS-1 newest prior generations,
+# so the pair being served is never collected from under Postfix.
 tls_prune_generations() {
-    local live gen skip
+    local live gen keep index
     live=$(readlink "${TLS_STATE_DIR}/live" 2>/dev/null || true)
-    skip=$((TLS_GENERATIONS + 1))
-    for gen in $(ls -1d "${TLS_STATE_DIR}"/gen.* 2>/dev/null | sort -r | tail -n "+${skip}"); do
-        if [ "$gen" != "$live" ]; then
+    keep=$((TLS_GENERATIONS - 1))
+    index=0
+    for gen in $(ls -1d "${TLS_STATE_DIR}"/gen.* 2>/dev/null | sort -r); do
+        [ "$gen" = "$live" ] && continue
+        index=$((index + 1))
+        if [ "$index" -gt "$keep" ]; then
             rm -rf "$gen"
         fi
     done
@@ -133,19 +158,19 @@ tls_prune_generations() {
 # Publish the pair Postfix reads. The key is written before the certificate, as
 # smtpd_tls_chain_files requires.
 tls_apply_postfix_conf() {
-    postconf -e "smtpd_tls_chain_files = $TLS_CHAIN_FILE"
+    postconf -e "smtpd_tls_chain_files = $TLS_CHAIN_FILE" || return 1
     # Postfix ignores the legacy key and certificate parameters once
     # smtpd_tls_chain_files is set, and warns while they are still non-empty.
-    postconf -e "smtpd_tls_cert_file ="
-    postconf -e "smtpd_tls_key_file ="
+    postconf -e "smtpd_tls_cert_file =" || return 1
+    postconf -e "smtpd_tls_key_file =" || return 1
 }
 
 # Copy the source pair into a fresh generation directory as one combined PEM,
 # validate the staged files, then publish the directory with a single symlink
 # rename. The source can be rewritten by the host at any point, so nothing that
 # is not a usable pair ever reaches the live path.
-tls_publish_pair() {
-    local cert="$1" key="$2" gen
+tls_publish_pair_locked() {
+    local cert="$1" key="$2" gen live_tmp
 
     if [ ! -e "$cert" ]; then
         echo "  certificate file not found: $cert"
@@ -162,7 +187,7 @@ tls_publish_pair() {
     mkdir -p "$TLS_STATE_DIR" || return 1
     # Unique per call: the same process can publish twice within one second
     # (startup publishes, then a renewal or an explicit re-publish follows).
-    gen="${TLS_STATE_DIR}/gen.$(date -u '+%Y%m%d%H%M%S').$$.${RANDOM}"
+    gen="${TLS_STATE_DIR}/gen.$(date -u '+%Y%m%d%H%M%S%N').$$.${RANDOM}"
     # Private directory and a restrictive umask in a subshell, so key material
     # never lands on disk with default permissions, not even while it is being
     # written or if the copy is interrupted.
@@ -187,22 +212,39 @@ tls_publish_pair() {
         rm -rf "$gen"
         return 1
     fi
-    chown root:postfix "$gen/tls.pem" 2>/dev/null
-    chmod 750 "$gen"
-    chmod 640 "$gen/tls.pem"
+    if ! chown root:postfix "$gen/tls.pem" 2>/dev/null ||
+       ! chmod 750 "$gen" || ! chmod 640 "$gen/tls.pem"; then
+        echo "  could not secure the published certificate permissions"
+        rm -rf "$gen"
+        return 1
+    fi
     rm -f "$gen/privkey.pem" "$gen/fullchain.pem"
     # One rename publishes the pair: no Postfix process can read a new
     # certificate with an old key, and a failure here leaves the previous pair
     # in place.
-    ln -sfn "$gen" "${TLS_STATE_DIR}/live.new" || { rm -rf "$gen"; return 1; }
-    if ! mv -Tf "${TLS_STATE_DIR}/live.new" "${TLS_STATE_DIR}/live" 2>/dev/null; then
+    # Use a per-invocation symlink name so simultaneous publishers do not
+    # replace or remove each other's staging links.
+    live_tmp="${TLS_STATE_DIR}/live.new.$$.$RANDOM"
+    ln -s "$gen" "$live_tmp" || { rm -rf "$gen"; return 1; }
+    if ! mv -Tf "$live_tmp" "${TLS_STATE_DIR}/live" 2>/dev/null; then
         echo "  could not activate the new certificate"
-        rm -f "${TLS_STATE_DIR}/live.new"
+        rm -f "$live_tmp"
         rm -rf "$gen"
         return 1
     fi
     tls_prune_generations
     return 0
+}
+
+# Serialize publication and pruning. Without this lock, one publisher could
+# prune another publisher's staged generation before its symlink is activated.
+# flock holds the lock for the whole subshell, including every early return.
+tls_publish_pair() {
+    mkdir -p "$TLS_STATE_DIR" || return 1
+    (
+        flock -x 9 || exit 1
+        tls_publish_pair_locked "$@"
+    ) 9>"${TLS_STATE_DIR}/.publish.lock"
 }
 
 # Re-point Postfix at the self-signed certificates. Needed on the fallback path:
@@ -211,9 +253,9 @@ tls_publish_pair() {
 # without this a later fallback would generate self-signed files that Postfix
 # never selects and keep serving the previously published pair.
 tls_apply_self_signed_conf() {
-    postconf -e "smtpd_tls_chain_files ="
-    postconf -e "smtpd_tls_cert_file = /etc/ssl/postfix/certs/postfix.crt"
-    postconf -e "smtpd_tls_key_file = /etc/ssl/postfix/private/postfix.key"
+    postconf -e "smtpd_tls_chain_files =" || return 1
+    postconf -e "smtpd_tls_cert_file = /etc/ssl/postfix/certs/postfix.crt" || return 1
+    postconf -e "smtpd_tls_key_file = /etc/ssl/postfix/private/postfix.key" || return 1
 }
 
 # Reload Postfix, but only when it is running: acme.sh runs this through

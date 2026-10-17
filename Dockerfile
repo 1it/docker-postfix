@@ -14,6 +14,7 @@ RUN apt-get update && \
     opendkim-tools \
     curl \
     socat \
+    util-linux \
     ca-certificates && \
     # acme.sh replaces certbot: a single shell script with no Python
     # dependency stack (removes the urllib3/cryptography CVE surface).
